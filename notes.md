@@ -29,3 +29,5 @@ return error
 **6. rename, atomic考虑**
 
 os.create语义，如果已存在会如何
+
+**7. defer unlock**

@@ -104,6 +104,7 @@ func (c *Coordinator) CanAssign(index int, task_type TaskType) bool {
 // get task, called by worker
 func (c *Coordinator) GetTask(args *EmptyArgs, reply *Task) error {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	get_task := false
 	for i := 0; i < len(c.File_name); i++ {
 		if c.CanAssign(i, Map) {
@@ -120,7 +121,6 @@ func (c *Coordinator) GetTask(args *EmptyArgs, reply *Task) error {
 	}
 
 	if get_task {
-		c.mutex.Unlock()
 		return nil
 	}
 
@@ -136,12 +136,13 @@ func (c *Coordinator) GetTask(args *EmptyArgs, reply *Task) error {
 			break
 		}
 	}
-	// release lock
-	c.mutex.Unlock()
+
 	if get_task {
 		return nil
 	}
-	if c.Done() {
+	// note don't call c.Done() due to we hold lock now
+	// just use c.All_finish is fine, otherwise deadlock, because Done try to lock but we hold lock
+	if c.All_finish {
 		reply.Task_type = NoMore
 	} else {
 		reply.Task_type = Wait
@@ -152,6 +153,7 @@ func (c *Coordinator) GetTask(args *EmptyArgs, reply *Task) error {
 
 func (c *Coordinator) FinishMap(args *TaskFinish, reply *EmptyArgs) error {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	if c.Map_status[args.Task_id] == Finish {
 		return nil
 	}
@@ -161,13 +163,14 @@ func (c *Coordinator) FinishMap(args *TaskFinish, reply *EmptyArgs) error {
 	for i := 0; i < c.Reduce_num; i++ {
 		c.Parition_file[i] = append(c.Parition_file[i], args.Output_file[i])
 	}
-	c.mutex.Unlock()
+
 	return nil
 }
 
 func (c *Coordinator) FinishReduce(args *TaskFinish, reply *EmptyArgs) error {
 	// lock
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	if c.Reduce_status[args.Task_id] == Finish {
 		return nil
 	}
@@ -178,7 +181,7 @@ func (c *Coordinator) FinishReduce(args *TaskFinish, reply *EmptyArgs) error {
 		c.All_finish = true
 	}
 	os.Rename(args.Output_file[0], "mr-out-"+strconv.Itoa(args.Task_id))
-	c.mutex.Unlock()
+
 	return nil
 }
 
