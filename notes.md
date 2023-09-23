@@ -31,3 +31,25 @@ return error
 os.create语义，如果已存在会如何
 
 **7. defer unlock**
+
+**8. 空接口**
+
+interface{}
+
+**9. atmoic**
+
+atomic load & sotre 与 lock
+
+**10. 2A的第二个测试超时问题**
+
+没有启动另一个协程来startElection，导致选举时如果分票就会无限阻塞
+
+**11. 投票后收到leader heartbeat将votefor置为-1**
+
+**12. hold lock when rcp**
+
+会导致dead lock
+
+**13. candidate时request vote，但是得到大多数票时，已经是follower状态**
+
+可能出现2个leader
