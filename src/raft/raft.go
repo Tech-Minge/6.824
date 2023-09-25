@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -69,9 +68,9 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	isLeader            int32
-	receiveHeartBeat    int32
-	heartbeat           int // millisecond
+	isLeader            bool
+	receiveHeartBeat    bool
+	heartbeatTimeout    int // millisecond
 	electionTimeoutLow  int // millisecond
 	electionTimeoutHigh int // millisecond
 }
@@ -83,7 +82,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Your code here (2A).
-	return rf.currentTerm, rf.isLeader != 0
+	return rf.currentTerm, rf.isLeader
 }
 
 //
@@ -172,7 +171,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	// //log entries
+	// log entries
 	LeaderCommit int
 }
 
@@ -203,11 +202,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	if args.Term > rf.currentTerm {
 		Debug(dInfo, "S%d update current term from %d to %d by Vote RPC", rf.me, rf.currentTerm, args.Term)
-		rf.currentTerm = args.Term
-		if rf.isLeader == 1 {
+		reply.Term = args.Term
+		rf.currentTerm = args.Term // update to new term
+		if rf.isLeader {
+			rf.isLeader = false // important
 			Debug(dLeader, "S%d from leader turn to follower by Vote RPC at time %s", rf.me, time.Now())
 		}
-		rf.isLeader = 0 // important
 	}
 	Debug(dInfo, "S%d vote for S%d at term %d", rf.me, rf.votedFor, rf.currentTerm)
 }
@@ -225,15 +225,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// only leader call AppendEntries RPC
 	if args.Term > rf.currentTerm {
 		Debug(dInfo, "S%d update current term from %d to %d by Append RPC", rf.me, rf.currentTerm, args.Term)
-		rf.currentTerm = args.Term
+		reply.Term = args.Term
+		rf.currentTerm = args.Term // update term
+		if rf.isLeader {
+			rf.isLeader = false
+			Debug(dLeader, "S%d from leader turn to follower by Append RPC at time %s", rf.me, time.Now())
+		}
+	}
+	if rf.isLeader {
+		// at same term, two leaders
+		Debug(dError, "%d and %d are leaders at same term %d", rf.me, args.LeaderId, rf.currentTerm)
+		panic("Two leaders at same term")
 	}
 	Debug(dInfo, "S%d receive Append RPC normally from S%d", rf.me, args.LeaderId)
-	rf.receiveHeartBeat = 1
-	if rf.isLeader == 1 {
-		Debug(dLeader, "S%d from leader turn to follower by Append RPC at time %s", rf.me, time.Now())
-	}
-	rf.isLeader = 0
-	// rf.votedFor = -1 // no need to reset, will cause bug!
+	rf.receiveHeartBeat = true
+	// rf.votedFor = -1 // no need to reset, will cause multi vote for others
 	reply.Success = true
 
 }
@@ -333,35 +339,38 @@ func (rf *Raft) ticker() {
 		var rand_sleep int
 		_, is_leader := rf.GetState()
 		if is_leader {
-			rand_sleep = rf.heartbeat
+			rand_sleep = rf.heartbeatTimeout
 		} else {
 			rand_sleep = rand.Int()%(rf.electionTimeoutHigh-rf.electionTimeoutLow) + rf.electionTimeoutLow
 		}
 		time.Sleep(time.Millisecond * time.Duration(rand_sleep))
-		_, is_leader = rf.GetState()
+
+		// double check
+		// key idea is to bind isLeader and currentTerm together
+		rf.mu.Lock()
+		is_leader = rf.isLeader
+		curr_term := rf.currentTerm
+		election := !rf.receiveHeartBeat
+		rf.receiveHeartBeat = false
+		rf.mu.Unlock()
+
 		if is_leader {
-			Debug(dTimer, "S%d prepare to send Append RPC at time %s", rf.me, time.Now())
-			go rf.sendHeartBeat()
-			continue
-		}
-		received_heart := atomic.LoadInt32(&rf.receiveHeartBeat)
-		if received_heart != 0 {
-			atomic.StoreInt32(&rf.receiveHeartBeat, 0)
-		} else {
-			// start election when no heart beat
-			Debug(dTimer, "S%d do not receive heartbeat and prepare to start election", rf.me)
-			go rf.startElection()
+			// no guarantee it's leader at newest term when sendHeartBeat
+			// maybe someone is leader at newer term
+			go rf.sendHeartBeat(curr_term)
+		} else if election {
+			go rf.startElection(curr_term + 1)
 		}
 	}
 }
 
 // send heart beat to follower
-func (rf *Raft) sendHeartBeat() {
-	rf.mu.Lock()
-	curr_term := rf.currentTerm
-	rf.mu.Unlock()
-	// early stop by judging whether is leader
-	for i := 0; i < len(rf.peers) && atomic.LoadInt32(&rf.isLeader) == 1; i++ {
+func (rf *Raft) sendHeartBeat(curr_term int) {
+	Debug(dTimer, "S%d prepare to send Append RPC at time %s", rf.me, time.Now())
+
+	// early stop by judging whether at specific term
+	keep_send := true
+	for i := 0; i < len(rf.peers) && keep_send; i++ {
 		if i == rf.me {
 			continue
 		}
@@ -376,40 +385,56 @@ func (rf *Raft) sendHeartBeat() {
 			} else {
 				Debug(dInfo, "S%d send Append RPC to S%d in failure due to timeout", rf.me, i)
 			}
+
 			if ok && !reply.Success && reply.Term > curr_term {
-				Debug(dInfo, "S%d send Append RPC to S%d find myself old in term %d, turn to follower", rf.me, i, curr_term)
-				atomic.StoreInt32(&rf.isLeader, 0)
+				rf.mu.Lock()
+				// implicit set keep_send to false
+				if rf.currentTerm == curr_term {
+					Debug(dInfo, "S%d send Append RPC to S%d find myself old in term %d, turn to follower and new turn", rf.me, i, curr_term)
+					if !rf.isLeader {
+						Debug(dError, "S%d isn't leader at term %d", rf.me, curr_term)
+						panic("Not leader at current term")
+					}
+					rf.isLeader = false
+					rf.currentTerm = reply.Term
+				} else {
+					Debug(dInfo, "S%d send Append RPC to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
+				}
+				rf.mu.Unlock()
 			}
 		}(i)
+		rf.mu.Lock()
+		keep_send = rf.currentTerm == curr_term
+		rf.mu.Unlock()
 	}
 }
 
 // start a election
-func (rf *Raft) startElection() {
+func (rf *Raft) startElection(curr_term int) {
 	rf.mu.Lock()
-	rf.currentTerm += 1
-	if rf.isLeader == 1 {
-		log.Panic("Leader for election")
+	if curr_term != rf.currentTerm+1 {
+		rf.mu.Unlock()
+		return
 	}
-	curr_term := rf.currentTerm
+	rf.currentTerm++
+	if rf.isLeader {
+		Debug(dError, "S%d is leader at previous term %d, but start election at next term %d", rf.me, curr_term-1, curr_term)
+		panic("Previouis term leader start next term's election")
+	}
 
-	Debug(dInfo, "S%d at start of elction vote for myself, and increment term to %d", rf.me, rf.currentTerm)
+	Debug(dInfo, "S%d start elction and vote for myself, and increment term to %d", rf.me, curr_term)
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
 
 	total := len(rf.peers)
-	finish := 0   // protected by mutex
-	votes := 0    // protected by mutex
-	stop := false // protected by mutex
-	var mutex sync.Mutex
-	cond := sync.NewCond(&mutex)
+	// protected by rf.mu
+	finish := 1
+	votes := 1
+	keep_election := true
+	cond := sync.NewCond(&rf.mu)
 
-	for i := 0; i < total; i++ {
+	for i := 0; i < total && keep_election; i++ {
 		if i == rf.me {
-			mutex.Lock()
-			finish++
-			votes++
-			mutex.Unlock()
 			continue
 		}
 		go func(i int) {
@@ -418,46 +443,64 @@ func (rf *Raft) startElection() {
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(i, &args, &reply)
 
-			mutex.Lock()
-			defer mutex.Unlock()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			finish++
 			if ok && reply.VoteGranted {
 				votes++
 				Debug(dInfo, "S%d get vote from S%d", rf.me, i)
 			} else if ok && reply.Term > curr_term {
-				stop = true
-				Debug(dInfo, "S%d terminate election due to know newer term %d compared to", rf.me, reply.Term, curr_term)
+				if rf.currentTerm == curr_term {
+					Debug(dInfo, "S%d send Vote RPC to S%d find myself old in term %d, turn to follower and new term", rf.me, i, curr_term)
+					if rf.isLeader {
+						Debug(dInfo, "S%d be leader before end of entire election, but find someone with new term", rf.me)
+					}
+					rf.isLeader = false
+					rf.currentTerm = reply.Term
+				} else {
+					Debug(dInfo, "S%d send Vote RPC to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
+				}
 			} else if ok && !reply.VoteGranted {
 				Debug(dInfo, "S%d fail to get vote peer already give others", rf.me)
 			} else if !ok {
 				Debug(dInfo, "S%d fail to get vote due to timeout to reach S%d", rf.me, i)
 			}
-			if stop || finish == total || votes > total/2 {
+			if !keep_election || finish == total || votes > total/2 {
 				cond.Broadcast()
 			}
 		}(i)
+		rf.mu.Lock()
+		keep_election = rf.currentTerm == curr_term
+		rf.mu.Unlock()
 	}
 
-	mutex.Lock()
+	rf.mu.Lock()
 	// don't forget myself's vote
-	for !stop && finish != total && votes <= total/2 {
+	for keep_election && finish != total && votes <= total/2 {
 		cond.Wait()
 	}
-	be_leader := true
-	if votes <= total/2 || stop {
-		be_leader = false
-	}
-	mutex.Unlock()
 
-	// check result and whether need to be follower
-	if be_leader {
-		atomic.StoreInt32(&rf.isLeader, 1)
-		// send heart beat to inform all followers
-		go rf.sendHeartBeat() // is it needed?? maybe error
-		Debug(dLeader, "S%d be leader at term %d at time %s", rf.me, rf.currentTerm, time.Now())
+	if votes <= total/2 || !keep_election {
+		// fail to be leader
+		Debug(dInfo, "S%d fail to be leader at term %d(no enought votes or detect newer term)", rf.me, curr_term)
 	} else {
-		Debug(dInfo, "S%d fail to be leader at term %d", rf.me, rf.currentTerm)
+		// maybe leader now, check term
+		if rf.currentTerm == curr_term {
+			// same term, be leader
+			if rf.isLeader {
+				Debug(dError, "S%d already be leader at term %d before set", rf.me, curr_term)
+				panic("Already be leader at current term")
+			}
+			rf.isLeader = true
+			Debug(dLeader, "S%d be leader at term %d at time %s", rf.me, curr_term, time.Now())
+			// send heart beat to inform all followers
+			go rf.sendHeartBeat(curr_term) // is it needed?? maybe error
+		} else {
+			Debug(dLeader, "S%d get majority votes, but term changes from %d to %d, fail to be leader", rf.me, curr_term, rf.currentTerm)
+		}
 	}
+	rf.mu.Unlock()
+
 }
 
 //
@@ -481,9 +524,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1 // indicate none at first
-	rf.isLeader = 0
-	rf.receiveHeartBeat = 0
-	rf.heartbeat = 200            // ms
+	rf.isLeader = false
+	rf.receiveHeartBeat = false
+	rf.heartbeatTimeout = 200     // ms
 	rf.electionTimeoutLow = 800   // ms
 	rf.electionTimeoutHigh = 1000 // ms
 	// initialize from state persisted before a crash

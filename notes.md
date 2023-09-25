@@ -46,10 +46,12 @@ atomic load & sotre 与 lock
 
 **11. 投票后收到leader heartbeat将votefor置为-1**
 
-**12. hold lock when rcp**
+**12. hold lock when rpc**
 
 会导致dead lock
 
 **13. candidate时request vote，但是得到大多数票时，已经是follower状态**
 
 可能出现2个leader
+
+**14. atomic mutex race检测**
