@@ -52,6 +52,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -65,14 +70,21 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
-	votedFor    int
+	currentTerm   int
+	votedFor      int
+	commitIndex   int
+	lastSendIndex int
 
 	isLeader            bool
 	receiveHeartBeat    bool
 	heartbeatTimeout    int // millisecond
 	electionTimeoutLow  int // millisecond
 	electionTimeoutHigh int // millisecond
+
+	log              []LogEntry
+	condForVote      *sync.Cond
+	condForCommitLog *sync.Cond
+	applyCh          chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -171,8 +183,8 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	// log entries
 	LeaderCommit int
+	Logs         []LogEntry
 }
 
 // reply of AppendEntries RPC
@@ -198,18 +210,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
-	reply.VoteGranted = true
-	rf.votedFor = args.CandidateId
+
 	if args.Term > rf.currentTerm {
 		Debug(dInfo, "S%d update current term from %d to %d by Vote RPC", rf.me, rf.currentTerm, args.Term)
 		reply.Term = args.Term
 		rf.currentTerm = args.Term // update to new term
+		rf.votedFor = -1
 		if rf.isLeader {
 			rf.isLeader = false // important
 			Debug(dLeader, "S%d from leader turn to follower by Vote RPC at time %s", rf.me, time.Now())
 		}
 	}
-	Debug(dInfo, "S%d vote for S%d at term %d", rf.me, rf.votedFor, rf.currentTerm)
+	lastIndex := len(rf.log) - 1
+	if rf.log[lastIndex].Term > args.LastLogterm || (rf.log[lastIndex].Term == args.LastLogterm && lastIndex > args.LastLogIndex) {
+		reply.VoteGranted = false
+		Debug(dInfo, "S%d reject vote for S%d at term %d due to its old log", rf.me, args.CandidateId, rf.currentTerm)
+	} else {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.receiveHeartBeat = true // set true, detail in paper figure 2
+		Debug(dInfo, "S%d vote for S%d at term %d, heart beat at time %s", rf.me, args.CandidateId, rf.currentTerm, time.Now())
+	}
+
 }
 
 // handler of AppendEntries RPC
@@ -227,6 +249,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(dInfo, "S%d update current term from %d to %d by Append RPC", rf.me, rf.currentTerm, args.Term)
 		reply.Term = args.Term
 		rf.currentTerm = args.Term // update term
+		rf.votedFor = -1           // needed??
 		if rf.isLeader {
 			rf.isLeader = false
 			Debug(dLeader, "S%d from leader turn to follower by Append RPC at time %s", rf.me, time.Now())
@@ -234,14 +257,84 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if rf.isLeader {
 		// at same term, two leaders
-		Debug(dError, "%d and %d are leaders at same term %d", rf.me, args.LeaderId, rf.currentTerm)
+		Debug(dError, "S%d and S%d are leaders at same term %d", rf.me, args.LeaderId, rf.currentTerm)
 		panic("Two leaders at same term")
 	}
-	Debug(dInfo, "S%d receive Append RPC normally from S%d", rf.me, args.LeaderId)
+	Debug(dInfo, "S%d receive Append RPC normally from S%d, heart beat at time %s", rf.me, args.LeaderId, time.Now())
 	rf.receiveHeartBeat = true
 	// rf.votedFor = -1 // no need to reset, will cause multi vote for others
 	reply.Success = true
 
+	if args.PrevLogIndex >= len(rf.log) {
+		Debug(dInfo, "S%d reject Append RPC due to leader previous log index too long, my log len %d, previous check at %d", rf.me, len(rf.log), args.PrevLogIndex)
+		reply.Success = false
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		Debug(dInfo, "S%d reject Append RPC due to inconsistent, my log at %d is term %d, but leader term %d", rf.me, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		// truncate log
+		rf.log = rf.log[:args.PrevLogIndex]
+		Debug(dInfo, "S%d delete all logs after(including) index %d", rf.me, args.PrevLogIndex)
+		for i := 1; i < len(rf.log); i++ {
+			Debug(dInfo, "S%d its %d index log term is %d", rf.me, i, rf.log[i].Term)
+		}
+		reply.Success = false
+	} else {
+		// pass consistency check, ready to append log
+		// skip append if already have
+		// if args.PrevLogIndex+len(args.Logs)+1 > len(rf.log) {
+		// 	rf.log = rf.log[:args.PrevLogIndex+1]
+		// 	rf.log = append(rf.log, args.Logs...)
+		// 	Debug(dInfo, "S%d append log in Append RPC from %d to %d", rf.me, args.PrevLogIndex+1, len(rf.log)-1)
+		// } else {
+		// 	Debug(dInfo, "S%d skip append log with args log len %d, my log len %d", rf.me, len(args.Logs), len(rf.log))
+		// }
+
+		Debug(dInfo, "S%d receive Append RPC with previous index %d and previous term %d, leader commit %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+		// check conflict in log
+		end_check := len(rf.log)
+		longer_than_leader := false
+		if end_check >= args.PrevLogIndex+1+len(args.Logs) {
+			longer_than_leader = true
+			end_check = args.PrevLogIndex + 1 + len(args.Logs)
+		}
+		i := 0
+		for i = args.PrevLogIndex + 1; i < end_check; i++ {
+			my_term := rf.log[i].Term
+			leader_term := args.Logs[i-args.PrevLogIndex-1].Term
+			if my_term == leader_term {
+				continue
+			} else {
+				// find conflict
+				Debug(dInfo, "S%d find inconsistency though passing previous check, at log index %d, my term %d leader term", rf.me, i, my_term, leader_term)
+				rf.log = rf.log[:i]
+				rf.log = append(rf.log, args.Logs[i-args.PrevLogIndex-1:]...)
+				Debug(dInfo, "S%d delete log after(including) index %d, append leader log len %d", rf.me, i, len(args.Logs[i-args.PrevLogIndex-1:]))
+				break
+			}
+		}
+		if i == end_check {
+			Debug(dInfo, "S%d find no conflict with leader at log, my log len %d", rf.me, len(rf.log))
+			if !longer_than_leader {
+				// no conflict, but leader is longer
+				rf.log = append(rf.log, args.Logs[len(rf.log)-args.PrevLogIndex-1:]...)
+				Debug(dInfo, "S%d no conflict and append leader log due to leader is longer, my log current len %d", rf.me, len(rf.log))
+			}
+		}
+
+		// advance commit index
+		if args.LeaderCommit > rf.commitIndex {
+			rec_index := rf.commitIndex
+			if args.LeaderCommit > len(rf.log)-1 {
+				rf.commitIndex = len(rf.log) - 1
+			} else {
+				rf.commitIndex = args.LeaderCommit
+			}
+			Debug(dInfo, "S%d advance its commit index from %d to %d", rf.me, rec_index, rf.commitIndex)
+			for i := 1; i <= rf.commitIndex; i++ {
+				Debug(dInfo, "S%d its %d index log term is %d", rf.me, i, rf.log[i].Term)
+			}
+			rf.condForCommitLog.Broadcast()
+		}
+	}
 }
 
 //
@@ -298,10 +391,18 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+	rf.mu.Lock()
+	index := 0
+	term := rf.currentTerm
+	isLeader := rf.isLeader
+	if isLeader {
+		index = len(rf.log)
+		rf.log = append(rf.log, LogEntry{term, command})
+	}
+	rf.mu.Unlock()
+	if isLeader {
+		go rf.tryAppendEntries(term, index)
+	}
 	// Your code here (2B).
 
 	return index, term, isLeader
@@ -343,10 +444,25 @@ func (rf *Raft) ticker() {
 		} else {
 			rand_sleep = rand.Int()%(rf.electionTimeoutHigh-rf.electionTimeoutLow) + rf.electionTimeoutLow
 		}
-		time.Sleep(time.Millisecond * time.Duration(rand_sleep))
+		Debug(dInfo, "S%d is about to sleep %d ms at time %s", rf.me, rand_sleep, time.Now())
+		sleep_time := 0
+		for sleep_time < rand_sleep {
+			cur_sleep := rf.heartbeatTimeout
+			if rand_sleep-sleep_time < rf.heartbeatTimeout {
+				cur_sleep = rand_sleep - sleep_time
+			}
+			time.Sleep(time.Millisecond * time.Duration(cur_sleep))
+			sleep_time += cur_sleep
+			_, is_leader = rf.GetState()
+			if is_leader && sleep_time != rand_sleep {
+				Debug(dInfo, "S%d is leader and early stop sleep, have sleeped %d ms with total %d at time %s", rf.me, sleep_time, rand_sleep, time.Now())
+				break
+			}
+		}
 
 		// double check
 		// key idea is to bind isLeader and currentTerm together
+		Debug(dInfo, "S%d is kicked off at time %s", rf.me, time.Now())
 		rf.mu.Lock()
 		is_leader = rf.isLeader
 		curr_term := rf.currentTerm
@@ -364,9 +480,119 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// check whether new committed log can be send to apply channel
+// every raft server need it!
+func (rf *Raft) sendCommitedLog() {
+	prev_commit_index := 0
+	for !rf.killed() {
+		rf.mu.Lock()
+		// push to channel
+		for prev_commit_index < rf.commitIndex {
+			prev_commit_index++
+			rf.applyCh <- ApplyMsg{true, rf.log[prev_commit_index].Command, prev_commit_index, false, []byte{}, 0, 0}
+			Debug(dInfo, "S%d confirm log commit index %d with term %d by sending to apply channel", rf.me, prev_commit_index, rf.log[prev_commit_index].Term)
+		}
+		rf.condForCommitLog.Wait()
+		rf.mu.Unlock()
+	}
+}
+
+// try to append log entries to follower
+func (rf *Raft) tryAppendEntries(curr_term int, log_index int) {
+	Debug(dLeader, "S%d get new command at index %d with current term %d, prepare to send Append RPC at time %s", rf.me, log_index, curr_term, time.Now())
+
+	// early stop by judging whether at specific term
+	keep_send := true
+	success := 1
+	total := len(rf.peers)
+
+	for i := 0; i < len(rf.peers) && keep_send; i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			// no need to protect rf.me, due to no write on it
+			prev_log_index := log_index
+			finished := false
+			timeout := false
+			for !finished && !rf.killed() {
+				time.Sleep(time.Millisecond * 10)
+				rf.mu.Lock()
+				if !timeout {
+					// when no rpc timeout, decrement
+					prev_log_index--
+				}
+				if prev_log_index >= len(rf.log) {
+					// when does this situation occur??
+					Debug(dError, "S%d try to get index %d while len %d, finished: %t", rf.me, prev_log_index, len(rf.log), finished)
+					rf.mu.Unlock()
+					return
+				}
+				prev_log_term := rf.log[prev_log_index].Term
+				// log := rf.log[prev_log_index+1 : log_index+1] // restrict range?? avoid confusion, maybe race!
+				log := make([]LogEntry, log_index-prev_log_index)
+				copy(log, rf.log[prev_log_index+1:log_index+1])
+				commit_index := rf.commitIndex
+				rf.mu.Unlock()
+				Debug(dLeader, "S%d leader send Append RPC to S%d with log start from %d to %d", rf.me, i, prev_log_index+1, log_index)
+
+				args := AppendEntriesArgs{curr_term, rf.me, prev_log_index, prev_log_term, commit_index, log}
+				var reply AppendEntriesReply
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				if ok {
+					Debug(dLeader, "S%d send Append RPC to S%d in without timeout, with reply: %t, %d", rf.me, i, reply.Success, reply.Term)
+					timeout = false
+				} else {
+					Debug(dLeader, "S%d send Append RPC to S%d in failure due to timeout", rf.me, i)
+					timeout = true
+					continue // indefinitely try??
+				}
+
+				// all situation with ok is true
+				if !reply.Success && reply.Term > curr_term {
+					rf.mu.Lock()
+					// implicit set keep_send to false
+					finished = true
+					if rf.currentTerm == curr_term {
+						Debug(dLeader, "S%d send Append RPC(try) to S%d find myself old in term %d, turn to follower and new turn", rf.me, i, curr_term)
+						if !rf.isLeader {
+							Debug(dError, "S%d isn't leader at term %d", rf.me, curr_term)
+							panic("Not leader at current term")
+						}
+						rf.isLeader = false
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1 // indicate none
+					} else {
+						Debug(dLeader, "S%d send Append RPC to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
+					}
+					rf.mu.Unlock()
+				} else if !reply.Success {
+					// inconsistency at log entries
+					Debug(dLeader, "S%d find S%d inconsistent at previous log index %d", rf.me, i, prev_log_index)
+				} else if reply.Success {
+					Debug(dLeader, "S%d append log from %d to %d to follower S%d", rf.me, prev_log_index+1, log_index, i)
+					rf.mu.Lock()
+					finished = true
+					success++
+					if success == total/2+1 && rf.commitIndex < log_index {
+						Debug(dLeader, "S%d leader incremnt log commit index from %d to %d", rf.me, rf.commitIndex, log_index)
+						rf.commitIndex = log_index
+						// notify goroutine
+						rf.condForCommitLog.Broadcast()
+					}
+					rf.mu.Unlock()
+				}
+			}
+		}(i)
+		rf.mu.Lock()
+		keep_send = rf.currentTerm == curr_term
+		rf.mu.Unlock()
+	}
+}
+
 // send heart beat to follower
 func (rf *Raft) sendHeartBeat(curr_term int) {
-	Debug(dTimer, "S%d prepare to send Append RPC at time %s", rf.me, time.Now())
+	Debug(dTimer, "S%d prepare to Heart Beat at time %s", rf.me, time.Now())
 
 	// early stop by judging whether at specific term
 	keep_send := true
@@ -376,29 +602,36 @@ func (rf *Raft) sendHeartBeat(curr_term int) {
 		}
 		go func(i int) {
 			// no need to protect rf.me, due to no write on it
-			args := AppendEntriesArgs{curr_term, rf.me, 0, 0, 0}
+			rf.mu.Lock()
+			commit_index := rf.commitIndex
+			prev_index := len(rf.log) - 1
+			prev_term := rf.log[prev_index].Term
+			rf.mu.Unlock()
+
+			args := AppendEntriesArgs{curr_term, rf.me, prev_index, prev_term, commit_index, []LogEntry{}}
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntries(i, &args, &reply)
 			// for loop if ok is false??
 			if ok {
-				Debug(dInfo, "S%d send Append RPC to S%d in without timeout, with reply: %t, %d", rf.me, i, reply.Success, reply.Term)
+				Debug(dLeader, "S%d send Heart Beat to S%d in without timeout, with reply: %t, %d", rf.me, i, reply.Success, reply.Term)
 			} else {
-				Debug(dInfo, "S%d send Append RPC to S%d in failure due to timeout", rf.me, i)
+				Debug(dLeader, "S%d send Heart Beat to S%d in failure due to timeout", rf.me, i)
 			}
 
 			if ok && !reply.Success && reply.Term > curr_term {
 				rf.mu.Lock()
 				// implicit set keep_send to false
 				if rf.currentTerm == curr_term {
-					Debug(dInfo, "S%d send Append RPC to S%d find myself old in term %d, turn to follower and new turn", rf.me, i, curr_term)
+					Debug(dLeader, "S%d send Heart Beat to S%d find myself old in term %d, turn to follower and new turn", rf.me, i, curr_term)
 					if !rf.isLeader {
 						Debug(dError, "S%d isn't leader at term %d", rf.me, curr_term)
 						panic("Not leader at current term")
 					}
 					rf.isLeader = false
 					rf.currentTerm = reply.Term
+					rf.votedFor = -1
 				} else {
-					Debug(dInfo, "S%d send Append RPC to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
+					Debug(dLeader, "S%d send Heart Beat to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
 				}
 				rf.mu.Unlock()
 			}
@@ -422,7 +655,7 @@ func (rf *Raft) startElection(curr_term int) {
 		panic("Previouis term leader start next term's election")
 	}
 
-	Debug(dInfo, "S%d start elction and vote for myself, and increment term to %d", rf.me, curr_term)
+	Debug(dInfo, "S%d start elction due to heartbeat timeout, vote for self, and increment term to %d, at time %s", rf.me, curr_term, time.Now())
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
 
@@ -431,7 +664,6 @@ func (rf *Raft) startElection(curr_term int) {
 	finish := 1
 	votes := 1
 	keep_election := true
-	cond := sync.NewCond(&rf.mu)
 
 	for i := 0; i < total && keep_election; i++ {
 		if i == rf.me {
@@ -439,7 +671,12 @@ func (rf *Raft) startElection(curr_term int) {
 		}
 		go func(i int) {
 			// no need to protect rf.me, due to no write on it
-			args := RequestVoteArgs{curr_term, rf.me, 0, 0}
+			rf.mu.Lock()
+			last_index := len(rf.log) - 1
+			last_term := rf.log[last_index].Term
+			rf.mu.Unlock()
+
+			args := RequestVoteArgs{curr_term, rf.me, last_index, last_term}
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(i, &args, &reply)
 
@@ -457,16 +694,17 @@ func (rf *Raft) startElection(curr_term int) {
 					}
 					rf.isLeader = false
 					rf.currentTerm = reply.Term
+					rf.votedFor = -1
 				} else {
 					Debug(dInfo, "S%d send Vote RPC to S%d althrough find myself old in term, but my term change from %d to %d", rf.me, i, curr_term, rf.currentTerm)
 				}
 			} else if ok && !reply.VoteGranted {
-				Debug(dInfo, "S%d fail to get vote peer already give others", rf.me)
+				Debug(dInfo, "S%d fail to get vote peer S%d", rf.me, i)
 			} else if !ok {
 				Debug(dInfo, "S%d fail to get vote due to timeout to reach S%d", rf.me, i)
 			}
 			if !keep_election || finish == total || votes > total/2 {
-				cond.Broadcast()
+				rf.condForVote.Broadcast()
 			}
 		}(i)
 		rf.mu.Lock()
@@ -477,11 +715,12 @@ func (rf *Raft) startElection(curr_term int) {
 	rf.mu.Lock()
 	// don't forget myself's vote
 	for keep_election && finish != total && votes <= total/2 {
-		cond.Wait()
+		rf.condForVote.Wait()
 	}
 
 	if votes <= total/2 || !keep_election {
 		// fail to be leader
+		rf.mu.Unlock()
 		Debug(dInfo, "S%d fail to be leader at term %d(no enought votes or detect newer term)", rf.me, curr_term)
 	} else {
 		// maybe leader now, check term
@@ -494,13 +733,14 @@ func (rf *Raft) startElection(curr_term int) {
 			rf.isLeader = true
 			Debug(dLeader, "S%d be leader at term %d at time %s", rf.me, curr_term, time.Now())
 			// send heart beat to inform all followers
+			rf.mu.Unlock()
 			go rf.sendHeartBeat(curr_term) // is it needed?? maybe error
 		} else {
+			rf.mu.Unlock()
 			Debug(dLeader, "S%d get majority votes, but term changes from %d to %d, fail to be leader", rf.me, curr_term, rf.currentTerm)
 		}
 	}
-	rf.mu.Unlock()
-
+	// rf.mu.Unlock()
 }
 
 //
@@ -526,14 +766,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1 // indicate none at first
 	rf.isLeader = false
 	rf.receiveHeartBeat = false
-	rf.heartbeatTimeout = 200     // ms
-	rf.electionTimeoutLow = 800   // ms
-	rf.electionTimeoutHigh = 1000 // ms
+	rf.commitIndex = 0
+	rf.lastSendIndex = 0
+	rf.heartbeatTimeout = 200    // ms
+	rf.electionTimeoutLow = 600  // ms
+	rf.electionTimeoutHigh = 800 // ms
+	rf.log = make([]LogEntry, 0)
+	rf.log = append(rf.log, LogEntry{0, 0}) // sentinel
+	rf.condForVote = sync.NewCond(&rf.mu)
+	rf.condForCommitLog = sync.NewCond(&rf.mu)
+	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.sendCommitedLog()
 	return rf
 }

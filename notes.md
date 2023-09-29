@@ -55,3 +55,19 @@ atomic load & sotre 与 lock
 可能出现2个leader
 
 **14. atomic mutex race检测**
+
+**15. 空接口与struct**
+
+struct内部有空接口
+
+**16. voteFor = -1**
+
+需要在更改term时设置，比如在send HeartBeat时发现term过时了，更新了term但是votefor不为-1，之后别人request vote就会失败
+
+**17. figure 2细节**
+
+比如If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
+
+**18. rf.log获取subslice有race**
+
+RPC的args有这个rf.log的读，后续有rf.log的写
