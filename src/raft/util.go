@@ -52,7 +52,7 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-var debug bool = true
+var debug bool = false
 
 func Debug(topic logTopic, format string, a ...interface{}) {
 	if debug {
