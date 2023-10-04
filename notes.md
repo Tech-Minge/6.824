@@ -68,6 +68,112 @@ struct内部有空接口
 
 比如If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
 
+only commit current term log
+
 **18. rf.log获取subslice有race**
 
 RPC的args有这个rf.log的读，后续有rf.log的写
+
+**19. new(bytes.Buffer)**
+
+gob.NewEncoder 具体流程
+
+persister 原理
+
+write crash 一致性 checksum
+
+**20. nextIndex 优化原理**
+
+leader re-init
+
+https://blog.csdn.net/ouyangyiwen/article/details/119902194
+
+**21. 收到old term的回复如何处理**
+
+**22. go func() curr_term**
+
+意义 是否需要实时check
+
+check term 当reply success时，对rf.nextIndex等数据结构更改时
+
+**23. batch 对test 2B的影响**
+
+batch=1 40s左右
+
+batch=20 >60s
+
+**24. 选举和be leader的race**
+
+861111 INFO S0 is kicked off at time 2023-10-02 15:35:50.247261106 +0800 CST m=+86.113856459
+
+861113 LEAD S0 get Append RPC reply from S4 in failure due to timeout
+
+861117 INFO S0 is about to sleep 516 ms at time 2023-10-02 15:35:50.247839229 +0800 CST m=+86.114434543
+
+861117 INFO S0 get vote from S2
+
+861119 LEAD S0 be leader at term 43 at time 2023-10-02 15:35:50.248067171 +0800 CST m=+86.114662466
+
+861121 LEAD S0 with current term 43, prepare to send Append RPC at time 2023-10-02 15:35:50.248240321 +0800 CST m=+86.114835610
+
+861124 ERRO S0 is leader at previous term 43, but start election at next term 44
+
+**25. 不同log len对log commit的影响**
+
+下面的例子导致commit到了49
+
+620674 LEAD S0 with current term 9, prepare to send Append RPC at time 2023-10-02 17:33:40.400626114 +0800 CST m=+62.070150017
+
+620676 LEAD S0 leader send Append RPC to S1 with log start from 7 to 48
+
+620679 LEAD S0 leader send Append RPC to S4 with log start from 30 to 48
+
+620686 LEAD S0 leader send Append RPC to S3 with log start from 30 to 48
+
+620687 LEAD S0 get command at log index 49 with current term 9
+
+620696 LEAD S0 leader send Append RPC to S2 with log start from 2 to 49
+
+620817 LEAD S0 append log from 7 to 48 to follower S1 in success
+
+620982 LEAD S0 append log from 2 to 49 to follower S2 in success
+
+620982 LEAD S0 leader incremnt log commit index from 6 to 49
+
+另外copy(log, rf.log[prev_log_index+1:log_len]) 设置log len
+
+104010 LEAD S2 increment next index of S3 from 87 to 90
+
+104011 LEAD S2 before sending Append RPC check term ok, current term 3
+
+104012 LEAD S2 want to send log entry to S1 from prev log index 51(not include) to log len 91, current term 3 current total log len 91
+
+104013 LEAD S2 leader send Append RPC to S1 with log start from 52 to 90
+
+104014 LEAD S4 get Append RPC reply from S0 in failure due to timeout
+
+104015 LEAD S2 before sending Append RPC check term ok, current term 3
+
+104016 LEAD S2 want to send log entry to S3 from prev log index 89(not include) to log len 91, current term 3 current total log len 91
+
+104016 LEAD S2 leader send Append RPC to S3 with log start from 90 to 90
+
+104021 LEAD S2 before sending Append RPC check term ok, current term 3
+
+104022 LEAD S2 want to send log entry to S4 from prev log index 1(not include) to log len 88, current term 3 current total log len 91
+
+104022 LEAD S2 leader send Append RPC to S4 with log start from 2 to 87
+
+104033 INFO S3 receive Append RPC normally from S2, heart beat at time 2023-10-03 12:35:20.43122001 +0800 CST m=+10.406158718
+
+104035 INFO S3 receive Append RPC with previous index 89 and previous term 3, leader commit 51, args log len 1
+
+104036 INFO S3 find no conflict with leader at log, my log len 90
+
+104037 INFO S3 append leader log due to leader is longer, my log current len 91
+
+104040 LEAD S2 before sending Append RPC check term ok, current term 3
+
+104041 LEAD S2 want to send log entry to S3 from prev log index 89(not include) to log len 88, current term 3 current total log len 91
+
+panic: runtime error: makeslice: len out of range
