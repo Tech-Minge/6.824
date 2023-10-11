@@ -177,3 +177,9 @@ batch=20 >60s
 104041 LEAD S2 want to send log entry to S3 from prev log index 89(not include) to log len 88, current term 3 current total log len 91
 
 panic: runtime error: makeslice: len out of range
+
+**26. chan和mutex混用导致死锁**
+
+sendCommitedLog 在持有rf.mu时向无buffer的channel发送数据，另一方面applier需要获取rf.mu来snapshot，这之后才会从channel读取数据
+
+applierSnap 函数

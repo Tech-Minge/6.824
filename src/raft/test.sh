@@ -7,7 +7,11 @@ for i in $(seq 1 $2); do
     echo -ne "\r$i / $2"
     LOG="$1_$i.txt"
     # Failed go test return nonzero exit codes
-    go test -race -run $1 &> $LOG
+    if [ "$1" = "all" ]; then
+        go test -race &> $LOG
+    else
+        go test -race -run $1 &> $LOG
+    fi
     if [[ $? -eq 0 ]]; then
         rm $LOG
     else

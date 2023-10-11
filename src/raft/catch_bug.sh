@@ -2,7 +2,7 @@
 i=0
 while ((++i)); do
     echo "start test $i"
-    go test -race -run TestBackup2B > log
+    go test -race -run 2D > log
     if [[ $? -eq 0 ]]; then
         rm log
     else
