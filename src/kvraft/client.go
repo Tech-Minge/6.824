@@ -1,13 +1,20 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"6.824/labrpc"
+	"6.824/raft"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	me        int
+	leaderId  int
+	requestId int // lock needed??
 }
 
 func nrand() int64 {
@@ -17,10 +24,16 @@ func nrand() int64 {
 	return x
 }
 
+var ckId int = 0
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.me = ckId
+	ckId++
+	ck.leaderId = -1
+	ck.requestId = 1 // default cycle buffer is 0 in KV
 	return ck
 }
 
@@ -39,7 +52,39 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	iter := 0
+	var serverId int
+	rq_id := ck.requestId
+	raft.Debug(raft.DKV, "C%d ready to send Get RPC request id %d", ck.me, rq_id)
+	ck.requestId++
+	for {
+		args := GetArgs{key, ck.me, rq_id}
+		var reply GetReply
+		if ck.leaderId == -1 {
+			time.Sleep(time.Millisecond * 100)
+			serverId = iter % len(ck.servers)
+			iter++
+			raft.Debug(raft.DClerk, "C%d don't know leader, iter with Get RPC Key %s", ck.me, key)
+		} else {
+			serverId = ck.leaderId
+			raft.Debug(raft.DClerk, "C%d know leader id %d send Get RPC with Key %s", ck.me, serverId, key)
+		}
+
+		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			raft.Debug(raft.DClerk, "C%d send Get RPC timeout with Key %s", ck.me, key)
+			continue
+		}
+		if reply.Err != ErrWrongLeader {
+			// if no key, "" is returned
+			ck.leaderId = serverId
+			raft.Debug(raft.DClerk, "C%d Get OK, key %s, value %s", ck.me, key, reply.Value)
+			return reply.Value
+		} else {
+			ck.leaderId = -1
+		}
+	}
+
 }
 
 //
@@ -54,6 +99,38 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	iter := 0
+	var serverId int
+	rq_id := ck.requestId
+	raft.Debug(raft.DKV, "C%d ready to send PutAppend RPC request id %d", ck.me, rq_id)
+	ck.requestId++
+	for {
+		args := PutAppendArgs{key, value, op, ck.me, rq_id}
+		var reply PutAppendReply
+		if ck.leaderId == -1 {
+			time.Sleep(time.Millisecond * 100)
+			serverId = iter % len(ck.servers)
+			iter++
+			raft.Debug(raft.DClerk, "C%d don't know leader, iter with PutAppend RPC Key %s, Value %s, op %s", ck.me, key, value, op)
+		} else {
+			serverId = ck.leaderId
+			raft.Debug(raft.DClerk, "C%d know leader id, send PutAppend RPC with Key %s, Value %s, op %s", ck.me, key, value, op)
+		}
+
+		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			raft.Debug(raft.DClerk, "C%d send PutAppend RPC timeout with Key %s, Value %s, op%s", ck.me, key, value, op)
+			continue
+		}
+		if reply.Err != ErrWrongLeader {
+			ck.leaderId = serverId
+			raft.Debug(raft.DClerk, "C%d PutAppend OK, Key %s, Value %s, op %s", ck.me, args.Key, args.Value, args.Op)
+			break
+		} else {
+			ck.leaderId = -1
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

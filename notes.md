@@ -183,3 +183,35 @@ panic: runtime error: makeslice: len out of range
 sendCommitedLog 在持有rf.mu时向无buffer的channel发送数据，另一方面applier需要获取rf.mu来snapshot，这之后才会从channel读取数据
 
 applierSnap 函数
+
+**27. clerk time sleep时长**
+
+**28. no-log if no other request**
+
+**29. clerk id, request id persist**
+
+**30. clerk request的先后顺序**
+
+**31. check重复请求**
+
+收到request时check，apply committed时chec
+
+**32. leader被隔离到小部分**
+
+收到request后，始终等待log被复制到大部分follower，但是回归到整体后，仍旧卡住
+
+**33. leader 收到新请求**
+
+leader0收到最新的请求，然后被隔离，client被卡死在RPC，leader0没有可以apply的新op，不会broadcast
+
+即便后来隔离恢复，client由于被卡死，不会再次发送请求，导致该请求不会被响应
+
+新增notify，原始每隔100 ms提醒，但是仍有问题
+
+比如leader收到新请求，replicate到几个follower，发现自己old term，因为之前被隔离的follower会快速增长term，于是leader重新选举，再次成为leader
+
+即便notify，仍会将client的RPC卡死
+
+notify需要check term
+
+**34. abgob.Register(Op{})**
