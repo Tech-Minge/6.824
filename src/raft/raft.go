@@ -229,7 +229,9 @@ func (rf *Raft) termByRelativeIndex(rlt_index int) int {
 // call it when holding lock
 func (rf *Raft) checkInstallInterval(i int) bool {
 	cur := time.Now()
-	if cur.Sub(rf.installTime[i]).Milliseconds() <= rf.installInterval {
+	diff := cur.Sub(rf.installTime[i]).Milliseconds()
+	if diff <= rf.installInterval {
+		Debug(dLeader, "S%d try to install snapshot to S%d, but too frequent with %d ms", rf.me, i, diff)
 		return false
 	}
 	rf.installTime[i] = cur
@@ -536,6 +538,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastSnapShotTerm = args.LastIncludedTerm
 	// persist
 	rf.persist2(args.Data)
+
+	Debug(dInfo, "S%d persist snapshot with last index %d and last term %d", rf.me, rf.lastSnapShotIndex, rf.lastSnapShotTerm)
 }
 
 //
@@ -706,8 +710,10 @@ func (rf *Raft) ticker() {
 
 // check whether new committed log can be send to apply channel
 // every raft server need it!
-func (rf *Raft) sendCommitedLog() {
-	prev_commit_index := 0
+func (rf *Raft) sendCommitedLog(lastSnapshotIndex int) {
+	prev_commit_index := lastSnapshotIndex
+	Debug(dInfo, "S%d send committed log routine starts with previos commit inex %d", rf.me, prev_commit_index)
+
 	for !rf.killed() {
 		rf.mu.Lock()
 		// if directly wait without check, will possibly lose wakeup
@@ -724,7 +730,7 @@ func (rf *Raft) sendCommitedLog() {
 			data := rf.persister.ReadSnapshot()
 			// Debug(dLog, "S%d read snapshot byte %v", data)
 			to_send = append(to_send, ApplyMsg{false, 0, 0, true, data, rf.lastSnapShotTerm, rf.lastSnapShotIndex})
-			Debug(dInfo, "S%d confirm log commit index %d to last snapshot index %d", rf.me, prev_commit_index, rf.lastSnapShotIndex)
+			Debug(dInfo, "S%d confirm log commit index %d to last snapshot index %d by snapshot", rf.me, prev_commit_index, rf.lastSnapShotIndex)
 		}
 
 		rec_prev_commit := prev_commit_index
@@ -777,6 +783,11 @@ func (rf *Raft) tryAppendEntries(curr_term int, timeout bool) {
 			// no need to protect rf.me, due to no write on it
 			rf.mu.Lock()
 			if !rf.checkTerm(curr_term, "before sending Append RPC") {
+				rf.mu.Unlock()
+				return
+			}
+			if !timeout && abs_log_len < rf.absoluteIndex(len(rf.log)) {
+				Debug(dError, "S%d target log len %d, but current log len %d", rf.me, abs_log_len, rf.absoluteIndex(len(rf.log)))
 				rf.mu.Unlock()
 				return
 			}
@@ -1092,9 +1103,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1 // indicate none at first
 	rf.isLeader = false
 	rf.receiveHeartBeat = false
-	rf.commitIndex = 0
-	rf.lastSnapShotIndex = -1 // indicate no snapshot yet
-	rf.lastSnapShotTerm = -1
+	// rf.commitIndex = 0
+	rf.lastSnapShotIndex = 0 // indicate no snapshot yet
+	rf.lastSnapShotTerm = 0
 	rf.heartbeatTimeout = 150    // ms
 	rf.electionTimeoutLow = 450  // ms
 	rf.electionTimeoutHigh = 600 // ms
@@ -1104,7 +1115,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.maxSendLogLen = 0
 
 	rf.log = make([]LogEntry, 0)
-	rf.log = append(rf.log, LogEntry{0, 0}) // sentinel
+	// rf.log = append(rf.log, LogEntry{0, 0}) // sentinel
 	rf.nextIndex = make([]int, len(peers))
 	rf.installTime = make([]time.Time, len(peers))
 	rf.condForVote = sync.NewCond(&rf.mu)
@@ -1112,13 +1123,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.lastSnapShotIndex
+
 	for i := 0; i < len(peers); i++ {
 		rf.nextIndex[i] = rf.absoluteIndex(len(rf.log)) // acutal index
 		rf.installTime[i] = time.Now()
 	}
 
-	// start ticker goroutine to start elections
+	go rf.sendCommitedLog(rf.lastSnapShotIndex)
+	// ticker goroutine is used to start elections
 	go rf.ticker()
-	go rf.sendCommitedLog()
+
 	return rf
 }

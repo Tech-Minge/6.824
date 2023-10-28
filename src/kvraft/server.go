@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,16 +34,10 @@ const SUCCESS status = 0
 const FAIL status = 1
 
 type Result struct {
-	requestId int
-	success   status
-	value     string // for Get only
+	RequestId int
+	Success   status
+	Value     string // for Get only
 }
-
-type requestStatus int
-
-const BEHIND requestStatus = 0
-const PROPER requestStatus = 1
-const AHEAD requestStatus = 2
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -53,13 +48,15 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 	// Your definitions here.
+	lastApplyIndex      int
+	persister           *raft.Persister
 	pendingRequestCount int
 	nextResultIndex     map[int]int // next index to store result
 	cacheRequestNum     int
 	db                  map[string]string
 	result              map[int][]Result // clerk id -> result (circle buffer)
 	condForApply        *sync.Cond
-	condForAheadRequest *sync.Cond
+	// condForAheadRequest *sync.Cond
 }
 
 // check Op duplicate
@@ -70,7 +67,7 @@ func (kv *KVServer) getRequestResult(clerk_id int, request_id int) int {
 		kv.nextResultIndex[clerk_id] = 0
 	}
 	for i := 0; i < len(res_slice); i++ {
-		if res_slice[i].requestId == request_id {
+		if res_slice[i].RequestId == request_id {
 			return i
 		}
 	}
@@ -124,9 +121,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.pendingRequestCount--
 	kv.mu.Unlock()
 
-	reply.Value = res.value
-	if res.success == SUCCESS {
-		raft.Debug(raft.DKV, "K%d know Get RPC finish with C%d request id %d, Key %s and Value %s in success", kv.me, args.ClerkId, args.RequestId, args.Key, res.value)
+	reply.Value = res.Value
+	if res.Success == SUCCESS {
+		raft.Debug(raft.DKV, "K%d know Get RPC finish with C%d request id %d, Key %s in success", kv.me, args.ClerkId, args.RequestId, args.Key)
 		reply.Err = OK
 	} else {
 		raft.Debug(raft.DKV, "K%d know Get RPC finish with C%d request id %d, Key %s but no such Key", kv.me, args.ClerkId, args.RequestId, args.Key)
@@ -165,7 +162,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			kv.mu.Unlock()
 			return
 		}
-		raft.Debug(raft.DKV, "K%d know raft maybe place PutAppend RPC at index %d with Key %s, Value %s, op %s", kv.me, cmd_index, args.Key, args.Value, args.Op)
+		raft.Debug(raft.DKV, "K%d know raft maybe place PutAppend RPC at index %d with Key %s", kv.me, cmd_index, args.Key)
 
 		for res_index == -1 {
 			kv.condForApply.Wait()
@@ -185,8 +182,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.pendingRequestCount--
 	kv.mu.Unlock()
 
-	raft.Debug(raft.DKV, "K%d know PutAppend RPC finish with C%d request id %d, Key %s, Current Value %s, op %s", kv.me, args.ClerkId, args.RequestId, args.Key, res.value, args.Op)
-	if res.success != SUCCESS {
+	raft.Debug(raft.DKV, "K%d know PutAppend RPC finish with C%d request id %d, Key %s", kv.me, args.ClerkId, args.RequestId, args.Key)
+	if res.Success != SUCCESS {
 		panic("KVserver Put Append Fail")
 	}
 	reply.Err = OK
@@ -203,6 +200,10 @@ func (kv *KVServer) applyCommittedLog() {
 			}
 			cmd_index := applymsg.CommandIndex
 			kv.mu.Lock()
+			if kv.lastApplyIndex >= cmd_index {
+				panic("KV cmd index too small")
+			}
+			kv.lastApplyIndex = cmd_index
 			may_duplicate_index := kv.getRequestResult(op.ClerkId, op.RequestId)
 			if may_duplicate_index != -1 {
 				raft.Debug(raft.DKV, "K%d find Duplicate RPC with C%d and request id %d, command index %d, duplicate index %d", kv.me, op.ClerkId, op.RequestId, cmd_index, may_duplicate_index)
@@ -222,34 +223,99 @@ func (kv *KVServer) applyCommittedLog() {
 				}
 			} else if op.Type == APPEND {
 				kv.db[op.Key] = v + op.Value
-				kv.result[op.ClerkId][res_index] = Result{op.RequestId, SUCCESS, kv.db[op.Key]}
+				kv.result[op.ClerkId][res_index] = Result{op.RequestId, SUCCESS, ""}
 			} else {
 				kv.db[op.Key] = op.Value
-				kv.result[op.ClerkId][res_index] = Result{op.RequestId, SUCCESS, kv.db[op.Key]}
+				kv.result[op.ClerkId][res_index] = Result{op.RequestId, SUCCESS, ""}
 			}
 			// notify
 			kv.condForApply.Broadcast()
 			kv.mu.Unlock()
-		} else {
+		} else if applymsg.SnapshotValid {
 			// snapshot
+			kv.mu.Lock()
+			if applymsg.SnapshotIndex <= kv.lastApplyIndex {
+				raft.Debug(raft.DKV, "K%d receive old snapshot with index %d and term %d, current apply index %d", kv.me, applymsg.SnapshotIndex, applymsg.SnapshotTerm, kv.lastApplyIndex)
+				panic("KV snapshot index too small")
+			} else {
+				rec_last_apply := kv.lastApplyIndex
+				kv.rebuildStatus(applymsg.Snapshot) // will update kv.lastApplyIndex
+				raft.Debug(raft.DKV, "K%d receive usable snapshot with index %d and term %d, current apply index %d while previous apply index %d", kv.me, applymsg.SnapshotIndex, applymsg.SnapshotTerm, kv.lastApplyIndex, rec_last_apply)
+			}
+			kv.mu.Unlock()
 		}
 
 	}
 }
 
+// check pending count when no longer is leader/term change
 func (kv *KVServer) notifier() {
 	term := 0
 	for !kv.killed() {
 		time.Sleep(time.Millisecond * 100)
-		kv.mu.Lock()
 		curr_term, leader := kv.rf.GetState()
-		if (!leader || curr_term != term) && kv.pendingRequestCount > 0 {
+		if leader && curr_term == term {
+			continue
+		}
+
+		kv.mu.Lock()
+		if kv.pendingRequestCount > 0 {
 			raft.Debug(raft.DKV, "K%d has pending request count %d, leader %t, current term %d, previous check term %d, notify it to reply", kv.me, kv.pendingRequestCount, leader, curr_term, term)
 			term = curr_term
 			kv.condForApply.Broadcast()
 		}
 		kv.mu.Unlock()
 	}
+}
+
+// call it when holding lock
+func (kv *KVServer) doSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.lastApplyIndex)
+	e.Encode(kv.db)
+	e.Encode(kv.result)
+	e.Encode(kv.nextResultIndex)
+	data := w.Bytes()
+
+	kv.rf.Snapshot(kv.lastApplyIndex, data)
+	raft.Debug(raft.DKV, "K%d finish snapshot with total size %d and last snapshot index %d", kv.me, len(data), kv.lastApplyIndex)
+}
+
+// check raft state size, if too large do snapshot
+func (kv *KVServer) snapshotter() {
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 100)
+		state_size := kv.persister.RaftStateSize()
+		if state_size >= kv.maxraftstate {
+			raft.Debug(raft.DKV, "K%d detect raft state size too large %d, threshold %d", kv.me, state_size, kv.maxraftstate)
+			kv.mu.Lock()
+			kv.doSnapshot()
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *KVServer) rebuildStatus(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastApply int
+	var database map[string]string
+	var nextIndex map[int]int
+	var res map[int][]Result
+
+	if d.Decode(&lastApply) != nil || d.Decode(&database) != nil || d.Decode(&res) != nil || d.Decode(&nextIndex) != nil {
+		panic("KV decode error")
+	}
+	kv.lastApplyIndex = lastApply
+	kv.db = database
+	kv.result = res
+	kv.nextResultIndex = nextIndex
+	raft.Debug(raft.DKV, "K%d rebuild status with last apply index %d, database len %d, result len %d, next index len %d", kv.me, lastApply, len(kv.db), len(kv.result), len(kv.nextResultIndex))
 }
 
 //
@@ -302,15 +368,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.lastApplyIndex = 0
+	kv.persister = persister
 	kv.pendingRequestCount = 0
 	kv.nextResultIndex = make(map[int]int)
-	kv.cacheRequestNum = 10
+	kv.cacheRequestNum = 3
 	kv.db = make(map[string]string)
 	kv.result = make(map[int][]Result)
 	kv.condForApply = sync.NewCond(&kv.mu)
-	kv.condForAheadRequest = sync.NewCond(&kv.mu)
+	// kv.condForAheadRequest = sync.NewCond(&kv.mu)
+
+	kv.rebuildStatus(kv.persister.ReadSnapshot())
+
 	go kv.applyCommittedLog()
 	go kv.notifier()
+	if kv.maxraftstate != -1 {
+		go kv.snapshotter()
+	}
 
 	return kv
 }

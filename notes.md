@@ -214,4 +214,22 @@ leader0收到最新的请求，然后被隔离，client被卡死在RPC，leader0
 
 notify需要check term
 
-**34. abgob.Register(Op{})**
+**34. labgob.Register(Op{})**
+
+**35. instant commit log**
+
+unlock 之后向channel发送applymsg，此时可能out of order
+
+即62-64 unlock - 65 unlock - 65 chan - 62 chan
+
+**36. atomic compare swap**
+
+https://stackoverflow.com/questions/75122412/what-does-it-mean-for-gos-compareandswap-to-return-false
+
+**37. raft sendcommittedlog**
+
+需要传入rf.lastSnapshotIndex，不能在内部获取，即便加上了lock
+
+**38. persit细究**
+
+raft和KV server关系
