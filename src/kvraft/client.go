@@ -71,6 +71,7 @@ func (ck *Clerk) Get(key string) string {
 
 		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply)
 		if !ok {
+			ck.leaderId = -1
 			raft.Debug(raft.DClerk, "C%d send Get RPC timeout with Key %s", ck.me, key)
 			continue
 		}
@@ -118,6 +119,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
+			ck.leaderId = -1
 			raft.Debug(raft.DClerk, "C%d send PutAppend RPC timeout with Key %s", ck.me, key)
 			continue
 		}

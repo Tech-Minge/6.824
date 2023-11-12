@@ -194,7 +194,7 @@ applierSnap 函数
 
 **31. check重复请求**
 
-收到request时check，apply committed时chec
+收到request时check，apply committed时check
 
 **32. leader被隔离到小部分**
 
@@ -233,3 +233,24 @@ https://stackoverflow.com/questions/75122412/what-does-it-mean-for-gos-comparean
 **38. persit细究**
 
 raft和KV server关系
+
+**39. query control是否需要raft日志**
+
+**40. golang map key/value 排序**
+
+https://stackoverflow.com/questions/18695346/how-can-i-sort-a-mapstringint-by-its-values
+
+**41. query previous**
+
+查询以往的config，如果leader崩溃，是否能够保证previous config一定能查到呢？
+
+假设leader收到一个最新的config
+
+1.复制到大多数节点，leader崩溃，没有回复；clerk重发config到新的leader
+
+2.没有复制到大多数，clerk重发config到新leader
+
+3.leader回复后崩溃，查询旧config，但是新leader没有commit这个config，因此借助raft来commit
+
+
+**42. allow more than one用处**

@@ -42,6 +42,8 @@ const (
 	dWarn    logTopic = "WARN"
 	DClerk   logTopic = "INFO"
 	DKV      logTopic = "INFO"
+	DSClerk  logTopic = "INFO"
+	DSCtrl   logTopic = "INFO"
 )
 
 var debugStart time.Time
