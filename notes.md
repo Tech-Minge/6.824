@@ -234,7 +234,7 @@ https://stackoverflow.com/questions/75122412/what-does-it-mean-for-gos-comparean
 
 raft和KV server关系
 
-**39. query control是否需要raft日志**
+**39. query config是否需要raft日志**
 
 **40. golang map key/value 排序**
 
@@ -252,5 +252,177 @@ https://stackoverflow.com/questions/18695346/how-can-i-sort-a-mapstringint-by-it
 
 3.leader回复后崩溃，查询旧config，但是新leader没有commit这个config，因此借助raft来commit
 
+timeout设置ck.leader=-1，否则一直尝试leader
 
 **42. allow more than one用处**
+
+
+**43. shardkv为什么需要make_end**
+
+与之前不同
+
+有什么作用
+
+**44. lock for clerk's leader id**
+
+是否需要
+
+**45. wrong group check**
+
+**46. transfer设计**
+
+process re-configurations one at a time, in order
+
+是否需要所有server来transfer，还是leader就可以
+
+如果需要所有server来，那么是否需要raft log commit之前所有在这个shard上的operation
+
+**47. crash recovery后的config**
+
+是否需要持久化config相关数据，例如lastCatchUp等
+
+**48. db变为[Nshards]map[string][string]**
+
+是否对之前的代码有影响
+
+目前仅修改了rebuildStatus中database的定义
+
+**49. race raft log persist**
+
+If you put a map or a slice in a Raft log entry, and your key/value server subsequently sees the entry on the applyCh and saves a reference to the map/slice in your key/value server's state, you may have a race. Make a copy of the map/slice, and store the copy in your key/value server's state. The race is between your key/value server modifying the map/slice and Raft reading it while persisting its log.
+
+two db slice copy
+
+**50. wait when higher config transfer**
+
+G0 -> config1 all G0 -> config2 transfer last 5 to G1
+
+G1 current config 0 recieve transfer RPC with G0 target config2
+
+**51. crash recovery**
+
+no-op, previous config log can't replay
+
+apply previous config relevant log too fast, can't catch up config
+
+**52. wait shard 阻塞**
+
+之前的设计如下
+
+    pendingRequestCount++
+		
+    for !kv.allWaitOK(to_be_wait)
+
+        kv.condForApply.Wait()
+
+        cmd_index, _, leader := kv.rf.Start(no-op)
+
+    pendingRequestCount--
+
+考虑如下情况
+
+034868 INFO G101 SK1 wait for agreement on wait shard with config num 2
+
+040715 INFO G101 SK1 has pending request count 1, leader false, current term 3, previous check term 2, notify it to reply
+
+040797 INFO G101 SK1 fail to try no-op at index 0 (no leader)
+
+040900 LEAD S1 be leader at term 3
+
+之后S1是leader，且term不变，就不会notifier了
+
+no-op是否可以简化pending notify的处理
+
+如下的逻辑是错误的
+
+    if leader && curr_term != term
+        kv.rf.Start(no-op)
+
+可能term刚改变，但不是leader，之后变为leader就不会no-op
+
+**53. slice of map 初始化**
+
+https://doc.yonyoucloud.com/doc/wiki/project/the-way-to-go/08.4.html
+
+**54. transfer时需要确保相关的操作都完成**
+
+比如append时，正在transfer，则会迁移出一个value不正确的key
+
+024903 INFO G101 SK0 get shard 2 Key 4 and Value 3X0blM_y6WLARPk
+
+024904 INFO G101 SK0 get shard 3 Key 5 and Value Ik8DmY0wKX
+
+起初允许在状态为transfer的shard，继续接收clerk的RPC
+
+后来不允许，原因见59
+
+**55. snapshot时的config, shard state**
+
+如果不记录config，那么snapshot时只有last apply和db，等到恢复时config从1开始，实际上replay了很多重复的config相关的日志
+
+shard state这个数组也是需要的，如果不包含，当snapshot时有将shard置为transfer状态的日志，还有将其置为others的日志
+
+这时crash，如果没有shard state数组，rebuild时就相当于错过了这些日志，这时直接进入到wait，本应该为others的状态目前为mine
+
+**56. apply wait in case of too ahead config**
+
+**57. wake up lose**
+    init_term := 0
+    for res_index == -1 {
+        if term, leader := kv.rf.GetState(); leader && init_term != term {
+            kv.lastShardOpTerm = term
+            init_term = term
+            kv.transferShard(to_be_transfer, next_config)
+        }
+        if kv.getRequestResult() != -1 {
+            break
+        }
+        kv.condForApply.Wait()
+        res_index = kv.getRequestResult()
+    }
+
+如果kv.transferShard之后没有检查，直接wait，可能永久阻塞
+
+一次虚假唤醒后，且第二次transferShard，此时恰好第一次transferShard完成并notify
+
+此时第二次transferShard结束，直接wait，造成阻塞
+
+**58. config log重复**
+
+首先某个group更新到config 11，随后crash并恢复
+
+这时依照旧的log可以更新到config 11，但是注意到比如从config 5更新到6时，需要transfer，这时leader就可能会Start一个重复的op
+
+**59. pending dead lock**
+
+G101 SK2 wait for pending requests of transferred shards with config num 8 to finish
+
+SK2等待pending的PutAppend RPC完成，但是PutAppend的cmd index又在transfer ok这个log之后
+
+因为transfer ok是crash之前就有的
+
+**60. 得到transfer的key-value后被误删**
+
+059089 INFO G100 SK0 pull new config num 10, shard slice [100 100 100 100 100 102 102 102 102 102]
+
+061830 INFO G100 SK0 pull new config num 11, shard slice [100 100 100 100 101 102 102 102 101 101]
+
+064602 INFO G100 SK0 know agreement on transfer shard with config num 11 has reached
+
+065114 INFO G101 SK0 applier get shard 4 Key 6 and Value gYiu4bQlrocGxU-Zw1BnUBvy from G100 config 11
+
+065406 INFO G101 SK1 applier get shard 4 Key 6 and Value gYiu4bQlrocGxU-Zw1BnUBvy from G100 config 11
+
+065584 INFO G101 SK2 applier get shard 4 Key 6 and Value gYiu4bQlrocGxU-Zw1BnUBvy from G100 config 11
+
+067029 INFO G100 SK0 rebuild status with config num 11, shard state [1 1 1 1 0 0 0 0 0 0]
+
+067209 INFO G100 SK0 applier get shard 4 Key 6 and Value gYiu4bQlrocGxU-Zw1BnUBvy from G101 config 12
+
+067210 INFO G100 SK0 know agreement on transfer shard finish OK with config num 11 has reached
+
+delete shards!
+
+067211 INFO G100 SK0 know nothing to wait when catching up to config num 11
+
+067211 INFO G100 SK0 catch up to config num 11, current shard status [1 1 1 1 1 0 0 0 0 0]

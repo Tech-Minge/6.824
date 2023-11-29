@@ -55,7 +55,7 @@ func (ck *Clerk) Get(key string) string {
 	iter := 0
 	var serverId int
 	rq_id := int(atomic.AddInt32(&ck.requestId, 1))
-	raft.Debug(raft.DKV, "C%d ready to send Get RPC request id %d", ck.me, rq_id)
+	raft.Debug(raft.DClerk, "C%d ready to send Get RPC request id %d", ck.me, rq_id)
 	for {
 		args := GetArgs{key, ck.me, rq_id}
 		var reply GetReply
@@ -103,7 +103,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	iter := 0
 	var serverId int
 	rq_id := int(atomic.AddInt32(&ck.requestId, 1))
-	raft.Debug(raft.DKV, "C%d ready to send PutAppend RPC request id %d", ck.me, rq_id)
+	raft.Debug(raft.DClerk, "C%d ready to send PutAppend RPC request id %d", ck.me, rq_id)
 	for {
 		args := PutAppendArgs{key, value, op, ck.me, rq_id}
 		var reply PutAppendReply

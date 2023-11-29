@@ -93,6 +93,12 @@ type Raft struct {
 	applyCh          chan ApplyMsg
 }
 
+func (rf *Raft) GetLastLogIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.absoluteIndex(len(rf.log) - 1)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {

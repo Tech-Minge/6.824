@@ -44,6 +44,8 @@ const (
 	DKV      logTopic = "INFO"
 	DSClerk  logTopic = "INFO"
 	DSCtrl   logTopic = "INFO"
+	DSKV     logTopic = "INFO"
+	DSKVClk  logTopic = "INFO"
 )
 
 var debugStart time.Time

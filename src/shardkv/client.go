@@ -8,11 +8,16 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+	"time"
+
+	"6.824/labrpc"
+	"6.824/raft"
+	"6.824/shardctrler"
+)
 
 //
 // which shard is a key in?
@@ -40,6 +45,9 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	me        int
+	leaderId  map[int]int // gid -> leader id
+	requestId int32
 }
 
 //
@@ -51,12 +59,26 @@ type Clerk struct {
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 //
+var ckId int32 = 0
+
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.me = int(atomic.AddInt32(&ckId, 1))
+	ck.leaderId = make(map[int]int)
+	ck.requestId = 0 // default cycle buffer is 0 in KV
 	return ck
+}
+
+// get group's leader id by key gid
+func (ck *Clerk) getGidLeaderId(gid int) int {
+	_, ok := ck.leaderId[gid]
+	if !ok {
+		ck.leaderId[gid] = -1
+	}
+	return ck.leaderId[gid]
 }
 
 //
@@ -66,33 +88,57 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+
+	rq_id := int(atomic.AddInt32(&ck.requestId, 1))
+	raft.Debug(raft.DSKVClk, "SKC%d ready to send Get RPC request id %d with key %s", ck.me, rq_id, key)
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
+			raft.Debug(raft.DSKVClk, "SKC%d try to send Get RPC with request id %d and shard %d to group %d", ck.me, rq_id, shard, gid)
+			// if know leader id, try it first
+			leader_offset := ck.getGidLeaderId(gid)
+			if leader_offset == -1 {
+				// don't know leader, try all servers in index order
+				leader_offset = 0
+				raft.Debug(raft.DSKVClk, "SKC%d don't know group %d leader id", ck.me, gid)
+			} else {
+				raft.Debug(raft.DSKVClk, "SKC%d know group %d leader id %d", ck.me, gid, leader_offset)
+			}
 			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+				real_si := (si + leader_offset) % len(servers)
+				srv := ck.make_end(servers[real_si])
+				args := GetArgs{key, ck.me, rq_id, shard}
 				var reply GetReply
+
 				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				if !ok {
+					ck.leaderId[gid] = -1
+					raft.Debug(raft.DSKVClk, "SKC%d send Get RPC with request id %d and shard %d timeout", ck.me, rq_id, shard)
+					continue
+				}
+
+				if reply.Err == ErrWrongGroup {
+					raft.Debug(raft.DSKVClk, "SKC%d send Get RPC with request id %d and shard %d to wrong group %d", ck.me, rq_id, shard, gid)
+					break
+				} else if reply.Err == ErrWrongLeader {
+					raft.Debug(raft.DSKVClk, "SKC%d send Get RPC with request id %d and shard %d to corret group %d but wrong leader %d", ck.me, rq_id, shard, gid, real_si)
+					ck.leaderId[gid] = -1
+					time.Sleep(100 * time.Millisecond)
+				} else {
+					// OK or NoKey
+					raft.Debug(raft.DSKVClk, "SKC%d send Get RPC with request id %d and shard %d finish OK", ck.me, rq_id, shard)
+					ck.leaderId[gid] = real_si
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 //
@@ -100,27 +146,50 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
 
+	rq_id := int(atomic.AddInt32(&ck.requestId, 1))
+	raft.Debug(raft.DSKVClk, "SKC%d ready to send PutAppend RPC request id %d with key %s", ck.me, rq_id, key)
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
+			raft.Debug(raft.DSKVClk, "SKC%d try to send PutAppend RPC with request id %d and shard %d to group %d", ck.me, rq_id, shard, gid)
+			// if know leader id, try it first
+			leader_offset := ck.getGidLeaderId(gid)
+			if leader_offset == -1 {
+				// don't know leader, try all servers in index order
+				leader_offset = 0
+				raft.Debug(raft.DSKVClk, "SKC%d don't know group %d leader id", ck.me, gid)
+			} else {
+				raft.Debug(raft.DSKVClk, "SKC%d know group %d leader id %d", ck.me, gid, leader_offset)
+			}
 			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+				real_si := (si + leader_offset) % len(servers)
+				srv := ck.make_end(servers[real_si])
+				args := PutAppendArgs{key, value, op, ck.me, rq_id, shard}
 				var reply PutAppendReply
+
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
+				if !ok {
+					ck.leaderId[gid] = -1
+					raft.Debug(raft.DSKVClk, "SKC%d send PutAppend RPC with request id %d and shard %d timeout", ck.me, rq_id, shard)
+					continue
+				}
+
+				if reply.Err == ErrWrongGroup {
+					raft.Debug(raft.DSKVClk, "SKC%d send PutAppend RPC with request id %d and shard %d to wrong group %d", ck.me, rq_id, shard, gid)
+					break
+				} else if reply.Err == ErrWrongLeader {
+					raft.Debug(raft.DSKVClk, "SKC%d send PutAppend RPC with request id %d and shard %d to corret group %d but wrong leader %d", ck.me, rq_id, shard, gid, real_si)
+					ck.leaderId[gid] = -1
+					time.Sleep(100 * time.Millisecond)
+				} else {
+					// OK or NoKey
+					raft.Debug(raft.DSKVClk, "SKC%d send PutAppend RPC with request id %d and shard %d finish OK", ck.me, rq_id, shard)
+					ck.leaderId[gid] = real_si
 					return
 				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
