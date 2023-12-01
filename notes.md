@@ -256,7 +256,6 @@ timeout设置ck.leader=-1，否则一直尝试leader
 
 **42. allow more than one用处**
 
-
 **43. shardkv为什么需要make_end**
 
 与之前不同
@@ -393,6 +392,8 @@ shard state这个数组也是需要的，如果不包含，当snapshot时有将s
 
 这时依照旧的log可以更新到config 11，但是注意到比如从config 5更新到6时，需要transfer，这时leader就可能会Start一个重复的op
 
+kv.lastApplyIndex == kv.rf.GetLastLogIndex()是否充分
+
 **59. pending dead lock**
 
 G101 SK2 wait for pending requests of transferred shards with config num 8 to finish
@@ -426,3 +427,47 @@ delete shards!
 067211 INFO G100 SK0 know nothing to wait when catching up to config num 11
 
 067211 INFO G100 SK0 catch up to config num 11, current shard status [1 1 1 1 1 0 0 0 0 0]
+
+**61. kv.lastApplyIndex位置**
+
+之前放在possible wait之前
+
+059926 INFO G101 SK2 ready to apply committed command index 37 with G102 config num 11 and request id 11
+
+059953 INFO G101 SK2 finish snapshot with total size 581 and last snapshot index 37
+
+37这个日志被截断
+
+059954 INFO G101 SK2 wait due to encounter ahead config num 11 from G102 while current config num 8
+
+060175 INFO G101 SK2 finish wait, target config num 11 from G102 and current config num 10
+
+060176 INFO G101 SK2 applier get shard 9 Key 1 and Value HtdeT-L1q5Hv from G102 config 11
+
+060176 INFO G101 SK2 applier set shard [8 9] to MINE with config 11 and install request result len 2
+
+060511 INFO G101 SK2 rebuild status with config 8, shard state [0 0 0 0 0 0 0 0 0 0], last apply index 37
+
+这里的8,9都是0
+
+应该要放在possible wait之后，且注意处理duplicate request的情况
+
+**62. transfer result时的注意点**
+
+不能transfer request id = 0的结果，这是无效的，也会对后续的transfer造成影响
+
+034114 INFO G102 SK0 applier APPEND Key 1 and Value 4d65s from SKC2, request id 17
+
+035629 INFO G100 SK2 transfer shard 0 with clerk id 2, request id 0
+
+035671 INFO G102 SK0 install request result with shard 0, clerk id 2 and request id 0
+
+035889 INFO G102 SK0 transfer shard 0 with clerk id 2, request id 0
+
+gid相关的result需不需要被transfer
+
+**63. install request result check**
+
+检查peer的是否更新，若自己的old，则不install
+
+request result整体逻辑

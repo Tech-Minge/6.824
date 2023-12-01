@@ -3,6 +3,7 @@ package shardctrler
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
@@ -27,9 +28,8 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-
-	configs []Config // indexed by config num
-
+	dead                int32
+	configs             []Config // indexed by config num
 	lastApplyIndex      int
 	persister           *raft.Persister
 	pendingRequestCount int
@@ -290,6 +290,11 @@ func (sc *ShardCtrler) Kill() {
 	// Your code here, if desired.
 }
 
+func (sc *ShardCtrler) killed() bool {
+	z := atomic.LoadInt32(&sc.dead)
+	return z == 1
+}
+
 // needed by shardkv tester
 func (sc *ShardCtrler) Raft() *raft.Raft {
 	return sc.rf
@@ -521,7 +526,7 @@ func (sc *ShardCtrler) queryHandler(config int) Config {
 }
 
 func (sc *ShardCtrler) applyCommittedLog() {
-	for {
+	for !sc.killed() {
 		applymsg := <-sc.applyCh
 		if applymsg.CommandValid {
 			// commnad
@@ -574,7 +579,7 @@ func (sc *ShardCtrler) applyCommittedLog() {
 // check pending count when no longer is leader/term change
 func (sc *ShardCtrler) notifier() {
 	term := 0
-	for {
+	for !sc.killed() {
 		time.Sleep(time.Millisecond * 100)
 		curr_term, leader := sc.rf.GetState()
 		if leader && curr_term == term {

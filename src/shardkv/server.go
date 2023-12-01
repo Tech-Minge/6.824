@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
@@ -67,12 +68,11 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	clerkOfContrller *shardctrler.Clerk
-	currentConfig    shardctrler.Config
-	leaderId         map[int]int // gid -> leader id
-	shardStatus      [shardctrler.NShards]ShardState
-	// pendingRequestOfShard [shardctrler.NShards]int
-	// pendingRequestMap   map[int]int // clerk id -> request id
+	dead                int32
+	clerkOfContrller    *shardctrler.Clerk
+	currentConfig       shardctrler.Config
+	leaderId            map[int]int // gid -> leader id
+	shardStatus         [shardctrler.NShards]ShardState
 	waiting             bool
 	lastShardOpTerm     int // config shard relevant term
 	lastApplyIndex      int
@@ -84,7 +84,6 @@ type ShardKV struct {
 	result              map[int][]Result // clerk id -> result (circle buffer)
 	condForApply        *sync.Cond
 	condForConfig       *sync.Cond
-	// condForPending      *sync.Cond
 }
 
 func gid2ClerkId(gid int) int {
@@ -122,20 +121,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	} else if kv.shardStatus[args.Shard] == WAIT {
 		panic("Not Expected For Get")
-		// // wait
-		// raft.Debug(raft.DSKV, "G%d SK%d receive Get RPC with Key %s and shard %d, although it's mine, haven't received it from its old owner", kv.gid, kv.me, args.Key, args.Shard)
-		// for kv.shardStatus[args.Shard] == WAIT {
-		// 	kv.condForConfig.Wait()
-		// }
-		// raft.Debug(raft.DSKV, "G%d SK%d find shard %d original wait, but current OK", kv.gid, kv.me, args.Shard)
-		// // maybe it's ok to be OTHERS and TRANSFER??
-		// // but set it panic current anyway
-		// if kv.shardStatus[args.Shard] == OTHERS || kv.shardStatus[args.Shard] == TRANSFER {
-		// 	panic("Error in shard status")
-		// }
 	}
 	kv.pendingRequestCount++
-	// kv.pendingRequestOfShard[args.Shard]++
 	res_index := kv.getRequestResult(args.ClerkId, args.RequestId)
 	if res_index == -1 {
 		op := Op{
@@ -152,10 +139,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 			raft.Debug(raft.DSKV, "G%d SK%d receive Get RPC with Key %s, but not leader", kv.gid, kv.me, args.Key)
 			kv.pendingRequestCount--
-			// kv.pendingRequestOfShard[args.Shard]--
-			// if kv.pendingRequestOfShard[args.Shard] == 0 {
-			// 	kv.condForPending.Broadcast()
-			// }
 			kv.mu.Unlock()
 			return
 		}
@@ -180,10 +163,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 				reply.Err = ErrWrongLeader
 				raft.Debug(raft.DSKV, "G%d SK%d wait Get RPC to finish with SKC%d request id %d, Key %s, but leader %t, current term %d, initial term %d", kv.gid, kv.me, args.ClerkId, args.RequestId, args.Key, curr_leader, curr_term, init_term)
 				kv.pendingRequestCount--
-				// kv.pendingRequestOfShard[args.Shard]--
-				// if kv.pendingRequestOfShard[args.Shard] == 0 {
-				// 	kv.condForPending.Broadcast()
-				// }
 				kv.mu.Unlock()
 				return
 			}
@@ -194,10 +173,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	res := kv.result[args.ClerkId][res_index]
 	kv.pendingRequestCount--
-	// kv.pendingRequestOfShard[args.Shard]--
-	// if kv.pendingRequestOfShard[args.Shard] == 0 {
-	// 	kv.condForPending.Broadcast()
-	// }
 	kv.mu.Unlock()
 
 	reply.Value = res.Value
@@ -229,20 +204,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	} else if kv.shardStatus[args.Shard] == WAIT {
 		panic("Not Expected For PutAppend")
-		// // wait
-		// raft.Debug(raft.DSKV, "G%d SK%d receive PutAppend RPC with Key %s and shard %d, although it's mine, haven't received it from its old owner", kv.gid, kv.me, args.Key, args.Shard)
-		// for kv.shardStatus[args.Shard] == WAIT {
-		// 	kv.condForConfig.Wait()
-		// }
-		// raft.Debug(raft.DSKV, "G%d SK%d find shard %d original wait, but current OK", kv.gid, kv.me, args.Shard)
-		// // maybe it's ok to be OTHERS and TRANSFER??
-		// // but set it panic current anyway
-		// if kv.shardStatus[args.Shard] == OTHERS || kv.shardStatus[args.Shard] == TRANSFER {
-		// 	panic("Error in shard status")
-		// }
 	}
 	kv.pendingRequestCount++
-	// kv.pendingRequestOfShard[args.Shard]++
 	res_index := kv.getRequestResult(args.ClerkId, args.RequestId)
 	if res_index == -1 {
 		op := Op{
@@ -264,10 +227,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrWrongLeader
 			raft.Debug(raft.DSKV, "G%d SK%d receive PutAppend RPC with Key %s, but not leader", kv.gid, kv.me, args.Key)
 			kv.pendingRequestCount--
-			// kv.pendingRequestOfShard[args.Shard]--
-			// if kv.pendingRequestOfShard[args.Shard] == 0 {
-			// 	kv.condForPending.Broadcast()
-			// }
 			kv.mu.Unlock()
 			return
 		}
@@ -291,10 +250,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				reply.Err = ErrWrongLeader
 				raft.Debug(raft.DSKV, "G%d SK%d wait PutAppend RPC to finish with SKC%d request id %d, Key %s, but leader %t, current term %d, initial term %d", kv.gid, kv.me, args.ClerkId, args.RequestId, args.Key, curr_leader, curr_term, init_term)
 				kv.pendingRequestCount--
-				// kv.pendingRequestOfShard[args.Shard]--
-				// if kv.pendingRequestOfShard[args.Shard] == 0 {
-				// 	kv.condForPending.Broadcast()
-				// }
 				kv.mu.Unlock()
 				return
 			}
@@ -305,10 +260,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	res := kv.result[args.ClerkId][res_index]
 	kv.pendingRequestCount--
-	// kv.pendingRequestOfShard[args.Shard]--
-	// if kv.pendingRequestOfShard[args.Shard] == 0 {
-	// 	kv.condForPending.Broadcast()
-	// }
 	kv.mu.Unlock()
 
 	raft.Debug(raft.DSKV, "G%d SK%d know PutAppend RPC finish with SKC%d request id %d, shard %d and Key %s in success", kv.gid, kv.me, args.ClerkId, args.RequestId, args.Shard, args.Key)
@@ -410,6 +361,12 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }
 
 // check Op duplicate
@@ -435,8 +392,15 @@ func (kv *ShardKV) putLatestRequestResult(result map[int]Result) {
 			kv.nextResultIndex[clerk_id] = 0
 		}
 		next := kv.nextResultIndex[clerk_id]
+		latest_index := (next - 1 + kv.cacheRequestNum) % kv.cacheRequestNum
+		latest_rq_id := kv.result[clerk_id][latest_index].RequestId
+		if latest_rq_id >= res.RequestId {
+			raft.Debug(raft.DSKV, "G%d SK%d fail to install request result with shard %d, clerk id %d and request id %d, due to latest request id %d", kv.gid, kv.me, res.Shard, clerk_id, res.RequestId, latest_rq_id)
+			continue
+		}
 		kv.result[clerk_id][next] = res
-		kv.nextResultIndex[clerk_id] = (kv.nextResultIndex[clerk_id] + 1) % kv.cacheRequestNum
+		kv.nextResultIndex[clerk_id] = (next + 1) % kv.cacheRequestNum
+		raft.Debug(raft.DSKV, "G%d SK%d install request result with shard %d, clerk id %d and request id %d at index %d", kv.gid, kv.me, res.Shard, clerk_id, res.RequestId, next)
 	}
 }
 
@@ -462,7 +426,7 @@ func (kv *ShardKV) possibleWait(gid, target_config int) {
 }
 
 func (kv *ShardKV) applier() {
-	for {
+	for !kv.killed() {
 		applymsg := <-kv.applyCh
 		if applymsg.CommandValid {
 			// commnad
@@ -475,7 +439,6 @@ func (kv *ShardKV) applier() {
 			if kv.lastApplyIndex >= cmd_index {
 				panic("Command Index Too Small")
 			}
-			kv.lastApplyIndex = cmd_index
 
 			possible_gid := clerkId2Gid(op.ClerkId)
 			possible_config_num := op.RequestId
@@ -492,6 +455,8 @@ func (kv *ShardKV) applier() {
 					// gid and check config num
 					raft.Debug(raft.DSKV, "G%d SK%d find duplicate RPC with G%d and config num %d with request id %d, command index %d, duplicate index %d", kv.gid, kv.me, possible_gid, possible_config_num, op.RequestId, cmd_index, may_duplicate_index)
 				}
+				// update last apply
+				kv.lastApplyIndex = cmd_index
 				kv.mu.Unlock()
 				continue
 			}
@@ -514,8 +479,10 @@ func (kv *ShardKV) applier() {
 				}
 				if !status {
 					curr_res.Success = FAIL
+					raft.Debug(raft.DSKV, "G%d SK%d applier GET Key %s fail from SKC%d, request id %d with shard %d", kv.gid, kv.me, op.Key, op.ClerkId, op.RequestId, op.Shard)
 				} else {
 					curr_res.Value = v
+					raft.Debug(raft.DSKV, "G%d SK%d applier GET Key %s and Value %s from SKC%d, request id %d with shard %d", kv.gid, kv.me, op.Key, v, op.ClerkId, op.RequestId, op.Shard)
 				}
 			case APPEND:
 				if kv.shardStatus[op.Shard] != MINE {
@@ -524,7 +491,7 @@ func (kv *ShardKV) applier() {
 					break
 				}
 				kv.db[op.Shard][op.Key] = v + op.Value
-				raft.Debug(raft.DSKV, "G%d SK%d applier APPEND Key %s and Value %s from SKC%d, request id %d", kv.gid, kv.me, op.Key, v+op.Value, op.ClerkId, op.RequestId)
+				raft.Debug(raft.DSKV, "G%d SK%d applier APPEND Key %s and Value %s from SKC%d, request id %d with shard %d", kv.gid, kv.me, op.Key, v+op.Value, op.ClerkId, op.RequestId, op.Shard)
 			case PUT:
 				if kv.shardStatus[op.Shard] != MINE {
 					skip = true
@@ -532,7 +499,7 @@ func (kv *ShardKV) applier() {
 					break
 				}
 				kv.db[op.Shard][op.Key] = op.Value
-				raft.Debug(raft.DSKV, "G%d SK%d applier PUT Key %s and Value %s from SKC%d, request id %d", kv.gid, kv.me, op.Key, op.Value, op.ClerkId, op.RequestId)
+				raft.Debug(raft.DSKV, "G%d SK%d applier PUT Key %s and Value %s from SKC%d, request id %d with shard %d", kv.gid, kv.me, op.Key, op.Value, op.ClerkId, op.RequestId, op.Shard)
 			case NOOP:
 				raft.Debug(raft.DSKV, "G%d SK%d applier receive NO-OP", kv.gid, kv.me)
 			case WAITOK:
@@ -562,13 +529,20 @@ func (kv *ShardKV) applier() {
 
 			if !skip {
 				res_index := kv.nextResultIndex[op.ClerkId]
-				kv.nextResultIndex[op.ClerkId] = (kv.nextResultIndex[op.ClerkId] + 1) % kv.cacheRequestNum
+				kv.nextResultIndex[op.ClerkId] = (res_index + 1) % kv.cacheRequestNum
 				kv.result[op.ClerkId][res_index] = curr_res
-			} else {
-				// skip, make sure clerk request return
-
+				raft.Debug(raft.DSKV, "G%d SK%d put result of clerk id %d and request id %d at index %d", kv.gid, kv.me, op.ClerkId, op.RequestId, res_index)
+				if op.Type == GET {
+					// invalid previous request result, save space
+					prev_index := (res_index - 1 + kv.cacheRequestNum) % kv.cacheRequestNum
+					kv.result[op.ClerkId][prev_index].Value = ""
+					raft.Debug(raft.DSKV, "G%d SK%d invalid Get request result at index %d", kv.gid, kv.me, prev_index)
+				}
 			}
-
+			// if put code below ahead of possible wait, there is risk
+			// due to possible wait may block and release lock
+			// at this time snapshot, cause wrong last apply index be snapshotted
+			kv.lastApplyIndex = cmd_index
 			// notify
 			kv.condForApply.Broadcast()
 			kv.mu.Unlock()
@@ -583,6 +557,7 @@ func (kv *ShardKV) applier() {
 				kv.rebuildStatus(applymsg.Snapshot) // will update kv.lastApplyIndex
 				raft.Debug(raft.DSKV, "G%d SK%d receive usable snapshot with index %d and term %d, current apply index %d while previous apply index %d", kv.gid, kv.me, applymsg.SnapshotIndex, applymsg.SnapshotTerm, kv.lastApplyIndex, rec_last_apply)
 			}
+			// cond notify??
 			kv.mu.Unlock()
 		}
 
@@ -596,7 +571,7 @@ func (kv *ShardKV) pendingNotifierAndCommitEnsurer() {
 	term := 0
 	last_op_term := 0
 
-	for {
+	for !kv.killed() {
 		time.Sleep(time.Millisecond * 100)
 		curr_term, leader := kv.rf.GetState()
 
@@ -632,8 +607,8 @@ func (kv *ShardKV) pendingNotifierAndCommitEnsurer() {
 	}
 }
 
-// call it when holding lock
 func (kv *ShardKV) doSnapshot() {
+	kv.mu.Lock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.lastApplyIndex)
@@ -646,18 +621,17 @@ func (kv *ShardKV) doSnapshot() {
 
 	kv.rf.Snapshot(kv.lastApplyIndex, data)
 	raft.Debug(raft.DSKV, "G%d SK%d finish snapshot with total size %d and last snapshot index %d", kv.gid, kv.me, len(data), kv.lastApplyIndex)
+	kv.mu.Unlock()
 }
 
 // check raft state size, if too large do snapshot
 func (kv *ShardKV) snapShotter() {
-	for {
+	for !kv.killed() {
 		time.Sleep(time.Millisecond * 100)
 		state_size := kv.persister.RaftStateSize()
 		if state_size >= kv.maxraftstate {
 			raft.Debug(raft.DSKV, "G%d SK%d detect raft state size too large %d, threshold %d", kv.gid, kv.me, state_size, kv.maxraftstate)
-			kv.mu.Lock()
 			kv.doSnapshot()
-			kv.mu.Unlock()
 		}
 	}
 }
@@ -696,19 +670,24 @@ func (kv *ShardKV) getLatestRequestResult(trans_slice []int) map[int]Result {
 
 	kv.mu.Lock()
 	for clerk, result_slice := range kv.result {
-		if clerkId2Gid(clerk) >= 0 {
+		if clerkId2Gid(clerk) >= 0 || clerk == -1 {
 			continue
 		}
 		latest_index := (kv.nextResultIndex[clerk] - 1 + kv.cacheRequestNum) % kv.cacheRequestNum
 		latest_shard := result_slice[latest_index].Shard
+		raft.Debug(raft.DSKV, "G%d SK%d find latest result of clerk id %d is request id %d and shard %d, at index %d", kv.gid, kv.me, clerk, result_slice[latest_index].RequestId, latest_shard, latest_index)
+		if result_slice[latest_index].RequestId == 0 {
+			continue
+		}
 		for _, shard := range trans_slice {
 			if shard == latest_shard {
 				trans_res[clerk] = result_slice[latest_index]
+				raft.Debug(raft.DSKV, "G%d SK%d transfer shard %d with clerk id %d, request id %d", kv.gid, kv.me, latest_shard, clerk, trans_res[clerk].RequestId)
 				break
 			}
 		}
 	}
-	raft.Debug(raft.DSKV, "G%d SK%d will transfer shard with clerk request len %d", kv.gid, kv.me, len(trans_res))
+	raft.Debug(raft.DSKV, "G%d SK%d transfer shard with total clerk request len %d", kv.gid, kv.me, len(trans_res))
 	kv.mu.Unlock()
 	return trans_res
 }
@@ -716,6 +695,7 @@ func (kv *ShardKV) getLatestRequestResult(trans_slice []int) map[int]Result {
 func (kv *ShardKV) transferShard(to_be_transfer []int, next_config *shardctrler.Config) {
 	// unlock!
 	kv.mu.Unlock()
+	leader := true
 
 	// transfer to group with all shard in once
 	gid2ShardSlice := make(map[int][]int)
@@ -743,7 +723,7 @@ func (kv *ShardKV) transferShard(to_be_transfer []int, next_config *shardctrler.
 			raft.Debug(raft.DSKV, "G%d SK%d know group %d leader id %d", kv.gid, kv.me, gid, leader_offset)
 		}
 
-		for {
+		for !kv.killed() {
 			exit := false
 			for si := 0; si < len(servers); si++ {
 				real_si := (si + leader_offset) % len(servers)
@@ -755,6 +735,12 @@ func (kv *ShardKV) transferShard(to_be_transfer []int, next_config *shardctrler.
 					ResultMap:  res_map,
 					ClerkId:    gid2ClerkId(kv.gid),
 					RequestId:  next_config.Num,
+				}
+
+				if _, leader = kv.rf.GetState(); !leader {
+					exit = true
+					raft.Debug(raft.DSKV, "G%d SK%d find I'm not leader when actually transfer shard, stop transfer", kv.gid, kv.me)
+					break
 				}
 
 				var reply TransferReply
@@ -784,17 +770,26 @@ func (kv *ShardKV) transferShard(to_be_transfer []int, next_config *shardctrler.
 				break
 			}
 		}
+		if !leader {
+			break
+		}
 	}
 
 	kv.mu.Lock() // avoid wake up lose
+	if !leader {
+		raft.Debug(raft.DSKV, "G%d SK%d stop actually transfer shard due to not leader", kv.gid, kv.me)
+		return
+	}
 	op := Op{
 		Type:       TRANOK,
 		ShardSlice: to_be_transfer,
 		ClerkId:    gid2ClerkId(kv.gid),
 		RequestId:  next_config.Num*2 + 1,
 	}
-	cmd_index, _, _ := kv.rf.Start(op)
-	raft.Debug(raft.DSKV, "G%d SK%d may put transfer finish OK at %d with config num %d", kv.gid, kv.me, cmd_index, next_config.Num)
+	cmd_index, _, isleader := kv.rf.Start(op)
+	if isleader {
+		raft.Debug(raft.DSKV, "G%d SK%d may put transfer finish OK at %d with config num %d", kv.gid, kv.me, cmd_index, next_config.Num)
+	}
 }
 
 // check whether all wait shard has been transferred to me
@@ -955,7 +950,7 @@ func (kv *ShardKV) configCatchUper(next_config *shardctrler.Config) {
 
 // fetch latest config from shard controller
 func (kv *ShardKV) configPuller() {
-	for {
+	for !kv.killed() {
 		kv.mu.Lock()
 		next_expected_config_num := kv.currentConfig.Num + 1
 		kv.mu.Unlock()
@@ -1031,12 +1026,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 	kv.pendingRequestCount = 0
 	kv.nextResultIndex = make(map[int]int)
-	kv.cacheRequestNum = 3
+	kv.cacheRequestNum = 2
 	kv.result = make(map[int][]Result)
-	// kv.pendingRequestMap = make(map[int]int)
 	kv.condForApply = sync.NewCond(&kv.mu)
 	kv.condForConfig = sync.NewCond(&kv.mu)
-	// kv.condForPending = sync.NewCond(&kv.mu)
 
 	for i := 0; i < shardctrler.NShards; i++ {
 		kv.shardStatus[i] = OTHERS
