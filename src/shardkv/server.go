@@ -398,9 +398,10 @@ func (kv *ShardKV) putLatestRequestResult(result map[int]Result) {
 			raft.Debug(raft.DSKV, "G%d SK%d fail to install request result with shard %d, clerk id %d and request id %d, due to latest request id %d", kv.gid, kv.me, res.Shard, clerk_id, res.RequestId, latest_rq_id)
 			continue
 		}
+		kv.result[clerk_id][latest_index].Value = "" // invalid
 		kv.result[clerk_id][next] = res
 		kv.nextResultIndex[clerk_id] = (next + 1) % kv.cacheRequestNum
-		raft.Debug(raft.DSKV, "G%d SK%d install request result with shard %d, clerk id %d and request id %d at index %d", kv.gid, kv.me, res.Shard, clerk_id, res.RequestId, next)
+		raft.Debug(raft.DSKV, "G%d SK%d install request result with shard %d, clerk id %d and request id %d at index %d, also invalid previous request result at index %d with request id %d", kv.gid, kv.me, res.Shard, clerk_id, res.RequestId, next, latest_index, latest_rq_id)
 	}
 }
 
@@ -612,15 +613,18 @@ func (kv *ShardKV) doSnapshot() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.lastApplyIndex)
+	db_before := len(w.Bytes())
 	e.Encode(kv.db)
+	db_after := len(w.Bytes())
 	e.Encode(kv.result)
+	res_after := len(w.Bytes())
 	e.Encode(kv.nextResultIndex)
 	e.Encode(kv.shardStatus)
 	e.Encode(kv.currentConfig)
 	data := w.Bytes()
 
 	kv.rf.Snapshot(kv.lastApplyIndex, data)
-	raft.Debug(raft.DSKV, "G%d SK%d finish snapshot with total size %d and last snapshot index %d", kv.gid, kv.me, len(data), kv.lastApplyIndex)
+	raft.Debug(raft.DSKV, "G%d SK%d finish snapshot with total size %d and last snapshot index %d, db size %d, result size %d", kv.gid, kv.me, len(data), kv.lastApplyIndex, db_after-db_before, res_after-db_after)
 	kv.mu.Unlock()
 }
 
@@ -803,17 +807,6 @@ func (kv *ShardKV) allWaitOK(wait_slice []int) bool {
 	return true
 }
 
-// check whether all to be transferred shard has no pending clerk request
-// call this when holding lock
-// func (kv *ShardKV) allPendingFinish(transfer_slice []int) bool {
-// 	for _, shard_idx := range transfer_slice {
-// 		if kv.pendingRequestOfShard[shard_idx] > 0 {
-// 			return false
-// 		}
-// 	}
-// 	return true
-// }
-
 // delete all transferred key-value pair
 // call this when holding lock
 func (kv *ShardKV) deleteTransferShards(transfer_slice []int) {
@@ -875,13 +868,6 @@ func (kv *ShardKV) configCatchUper(next_config *shardctrler.Config) {
 		}
 		kv.waiting = false
 		raft.Debug(raft.DSKV, "G%d SK%d know agreement on transfer shard with config num %d has reached", kv.gid, kv.me, next_config.Num)
-
-		// wait for all requests relevant to transferred shards have been finished
-		// raft.Debug(raft.DSKV, "G%d SK%d wait for pending requests of transferred shards with config num %d to finish", kv.gid, kv.me, next_config.Num)
-		// for !kv.allPendingFinish(to_be_transfer) {
-		// 	kv.condForPending.Wait()
-		// }
-		// raft.Debug(raft.DSKV, "G%d SK%d know all pending requests of transferred shards with config num %d have been finished", kv.gid, kv.me, next_config.Num)
 
 		raft.Debug(raft.DSKV, "G%d SK%d wait for agreement on transfer shard finish OK with config num %d", kv.gid, kv.me, next_config.Num)
 		res_index = kv.getRequestResult(gid2ClerkId(kv.gid), next_config.Num*2+1)

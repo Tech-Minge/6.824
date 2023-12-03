@@ -309,13 +309,9 @@ apply previous config relevant log too fast, can't catch up config
 之前的设计如下
 
     pendingRequestCount++
-		
     for !kv.allWaitOK(to_be_wait)
-
         kv.condForApply.Wait()
-
         cmd_index, _, leader := kv.rf.Start(no-op)
-
     pendingRequestCount--
 
 考虑如下情况
@@ -366,6 +362,7 @@ shard state这个数组也是需要的，如果不包含，当snapshot时有将s
 **56. apply wait in case of too ahead config**
 
 **57. wake up lose**
+
     init_term := 0
     for res_index == -1 {
         if term, leader := kv.rf.GetState(); leader && init_term != term {
